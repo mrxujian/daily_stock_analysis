@@ -340,7 +340,7 @@ class _AllModelsFailedError(Exception):
         self.last_usage = last_usage or {}
 
 
-from src.utils.data_processing import normalize_report_signal_attribution
+from src.utils.data_processing import strip_report_signal_attribution
 
 
 def check_content_integrity(
@@ -354,7 +354,7 @@ def check_content_integrity(
 
     Note:
     - Required fields: missing → pass=False, added to missing_fields
-    - Optional fields (e.g., signal_attribution): missing → pass=True and are not added to missing_fields
+    - Optional fields: missing → pass=True and are not added to missing_fields
     """
     missing: List[str] = []
 
@@ -1309,6 +1309,185 @@ def validate_sniper_price_sanity(
     return warnings
 
 
+def validate_llm_numbers(
+    result: "AnalysisResult",
+    context: Optional[Dict[str, Any]] = None,
+    trend_result: Any = None,
+) -> Dict[str, Any]:
+    """Verify LLM-reported numbers against computed values (DSA v5 P0-7).
+
+    Checks, in order:
+    - MA claims: any MA5/MA10/MA20 value the LLM states in free text
+      (ma_analysis / technical_analysis) must match the computed value
+      from closed daily bars within 0.01. A mismatch is a hard failure:
+      the report is marked unverified and sending is blocked.
+    - Sniper points: must be finite positives inside a plausible band
+      around the spot price (0.5x-1.5x). The points are NOT checked
+      against a deterministic formula because none exists yet; they are
+      recorded as "model opinion, not programmatically verifiable"
+      (模型观点、不可程序验真) until a rule-based formula is specified.
+    - RSI: the LLM's stated RSI is recorded only. The system computes
+      RSI(6/12/24) via Wilder; it does not compute RSI(14), and the
+      algorithm is not unified (precondition 1 open, task sheet
+      DSA-LD-OPEN-20261125-01). RSI therefore never hard-fails and its
+      algorithm is never hard-coded here.
+
+    Returns a dict with status "passed" | "failed" | "no_claims" |
+    "unverifiable", a reason string when failed, and the per-check
+    records. The pipeline writes this record into
+    dashboard["data_perspective"]["number_validation"].
+    """
+    ctx = context if isinstance(context, dict) else {}
+    trend_ctx = ctx.get("trend_result") if isinstance(ctx.get("trend_result"), dict) else {}
+    trend_analysis = ctx.get("trend_analysis") if isinstance(ctx.get("trend_analysis"), dict) else {}
+    today = ctx.get("today") if isinstance(ctx.get("today"), dict) else {}
+    snapshot = result.market_snapshot if isinstance(getattr(result, "market_snapshot", None), dict) else {}
+    dash = result.dashboard if isinstance(getattr(result, "dashboard", None), dict) else None
+    dp = dash.get("data_perspective") if isinstance(dash, dict) and isinstance(dash.get("data_perspective"), dict) else {}
+    pp = dp.get("price_position") if isinstance(dp.get("price_position"), dict) else {}
+
+    trend_dict = None
+    if isinstance(trend_result, dict):
+        trend_dict = trend_result
+    elif trend_result is not None and hasattr(trend_result, "to_dict"):
+        try:
+            trend_dict = trend_result.to_dict()
+        except Exception:
+            trend_dict = None
+    if not isinstance(trend_dict, dict):
+        trend_dict = {}
+
+    references: Dict[str, float] = {}
+    for key in ("ma5", "ma10", "ma20", "ma60"):
+        for source in (trend_dict, trend_ctx, trend_analysis, today, ctx, snapshot, pp):
+            value = _extract_positive_finite_float(source.get(key))
+            if value is not None:
+                references[key] = value
+                break
+    current_price = None
+    for candidate in (
+        getattr(result, "current_price", None),
+        trend_dict.get("current_price"),
+        trend_ctx.get("current_price"),
+        ctx.get("current_price"),
+        pp.get("current_price"),
+    ):
+        current_price = _extract_positive_finite_float(candidate)
+        if current_price is not None:
+            break
+
+    checks: List[Dict[str, Any]] = []
+    failures: List[str] = []
+
+    # --- MA claims in free text ---
+    text = "\n".join(
+        str(getattr(result, field, "") or "")
+        for field in ("ma_analysis", "technical_analysis")
+    )
+    ma_patterns = [
+        (r"MA\s*5\s*[:：=为是]?\s*([0-9]+\.[0-9]+|[0-9]+)", "ma5"),
+        (r"MA\s*10\s*[:：=为是]?\s*([0-9]+\.[0-9]+|[0-9]+)", "ma10"),
+        (r"MA\s*20\s*[:：=为是]?\s*([0-9]+\.[0-9]+|[0-9]+)", "ma20"),
+        (r"5\s*日均线\s*[:：=为是]?\s*([0-9]+\.[0-9]+|[0-9]+)", "ma5"),
+        (r"10\s*日均线\s*[:：=为是]?\s*([0-9]+\.[0-9]+|[0-9]+)", "ma10"),
+        (r"20\s*日均线\s*[:：=为是]?\s*([0-9]+\.[0-9]+|[0-9]+)", "ma20"),
+    ]
+    for pattern, key in ma_patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        claimed = _extract_positive_finite_float(match.group(1))
+        reference = references.get(key)
+        record: Dict[str, Any] = {
+            "kind": "ma_claim",
+            "key": key,
+            "claimed": claimed,
+            "reference": reference,
+        }
+        if claimed is None or reference is None:
+            record["status"] = "unverifiable"
+            record["note"] = "no computed reference available"
+        elif abs(claimed - reference) > 0.01:
+            record["status"] = "failed"
+            record["note"] = f"claimed {claimed} vs computed {reference}"
+            failures.append(f"{key} claimed {claimed} vs computed {reference}")
+        else:
+            record["status"] = "passed"
+        checks.append(record)
+
+    # --- Sniper points: plausibility band + model-opinion label ---
+    price_references = {"spot": current_price}
+    price_references.update(references)
+    raw_points = _extract_raw_sniper_points(result)
+    for point_name in ("ideal_buy", "secondary_buy", "stop_loss", "take_profit"):
+        point = _extract_sniper_price_only(raw_points.get(point_name), price_references)
+        if point is None:
+            continue
+        record = {
+            "kind": "sniper_point",
+            "key": point_name,
+            "value": point,
+            "label": "模型观点、不可程序验真",
+        }
+        if current_price is not None and not (0.5 * current_price <= point <= 1.5 * current_price):
+            record["status"] = "failed"
+            record["note"] = f"outside 0.5x-1.5x band around spot {current_price}"
+            failures.append(f"{point_name} {point} outside plausible band around {current_price}")
+        else:
+            record["status"] = "passed"
+        checks.append(record)
+
+    # --- RSI: recorded only, never hard-fails (precondition 1 open) ---
+    rsi_match = re.search(
+        # The window (14/6/12/24, optionally parenthesised) must match as a
+        # whole token: a bare \d+ group would eat the leading digits of
+        # the value itself ("RSI 25.9" -> 5.9).
+        r"RSI\s*(?:\(\s*\d+\s*\)|14|6|12|24)?\s*[:：=为是]?\s*([0-9]+\.[0-9]+|[0-9]+)",
+        text,
+    )
+    rsi_record: Dict[str, Any] = {
+        "kind": "rsi",
+        "llm_claimed": None,
+        "system_rsi_6": trend_dict.get("rsi_6") or trend_ctx.get("rsi_6"),
+        "system_rsi_12": trend_dict.get("rsi_12") or trend_ctx.get("rsi_12"),
+        "system_rsi_24": trend_dict.get("rsi_24") or trend_ctx.get("rsi_24"),
+        "system_rsi_14": None,
+        "status": "unverifiable",
+        "note": (
+            "RSI algorithm not unified (precondition 1 open, "
+            "DSA-LD-OPEN-20261125-01); system computes RSI(6/12/24) via "
+            "Wilder, no RSI(14) reference exists; recorded only, "
+            "never hard-fails, never hard-coded"
+        ),
+    }
+    if rsi_match:
+        rsi_record["llm_claimed"] = _extract_positive_finite_float(rsi_match.group(1))
+    checks.append(rsi_record)
+
+    if failures:
+        status = "failed"
+        reason = "LLM number verification failed: " + "; ".join(failures)
+    elif any(c.get("kind") == "ma_claim" for c in checks):
+        status = "passed"
+        reason = None
+    else:
+        status = "no_claims"
+        reason = None
+    if status == "failed":
+        logger.warning(
+            "[number_validation] %s(%s) %s",
+            getattr(result, "name", ""),
+            getattr(result, "code", ""),
+            reason,
+        )
+    return {
+        "status": status,
+        "reason": reason,
+        "checks": checks,
+        "rsi": rsi_record,
+    }
+
+
 def stabilize_decision_with_structure(
     result: "AnalysisResult",
     trend_result: Any = None,
@@ -2052,6 +2231,13 @@ class AnalysisResult:
     data_sources: str = ""  # 数据来源说明
     success: bool = True
     error_message: Optional[str] = None
+    # DSA v5 verification gates (P0-7 / P0-3 / P1-5). verification_status:
+    # "verified" | "unverified" | "blocked_pending_confirmation" |
+    # "data_status_only" | None (not yet gated). When send_blocked_reason
+    # is set, the notification path must not send the result to any
+    # channel; the report file is still saved for the audit trail.
+    verification_status: Optional[str] = None
+    send_blocked_reason: Optional[str] = None
 
     # ========== 价格数据（分析时快照）==========
     current_price: Optional[float] = None  # 分析时的股价
@@ -2105,6 +2291,8 @@ class AnalysisResult:
             'news_evidence_present': self.news_evidence_present,
             'success': self.success,
             'error_message': self.error_message,
+            'verification_status': self.verification_status,
+            'send_blocked_reason': self.send_blocked_reason,
             'current_price': self.current_price,
             'change_pct': self.change_pct,
             'model_used': self.model_used,
@@ -2319,14 +2507,6 @@ class GeminiAnalyzer:
             "data_limitations": ["阶段或数据质量限制1", "阶段或数据质量限制2"]
         },
 
-        "signal_attribution": {
-            "technical_indicators": 技术指标贡献度(0-100),
-            "news_sentiment": 新闻舆情贡献度(0-100),
-            "fundamentals": 基本面贡献度(0-100),
-            "market_conditions": 市场环境贡献度(0-100),
-            "strongest_bullish_signal": "最强看多信号名称",
-            "strongest_bearish_signal": "最强看空信号名称"
-        }
     },
 
     "analysis_summary": "100字综合分析摘要",
@@ -2399,7 +2579,6 @@ class GeminiAnalyzer:
 - 只有在接近支撑确认或有效突破压力，且资金流/量价配合时，才能给出买入；接近压力且资金流出时不得追买。
 - 只有在跌破关键支撑、主力资金持续流出或风险显著放大时，才能给出卖出/减仓。
 - 必须输出 `dashboard.phase_decision` 七字段；盘中/午休/临近收盘要给出当前动作、观察条件和下一次检查点。
-- 建议输出可选展示字段 `dashboard.signal_attribution` 六字段；解释推荐理由的构成，包括技术指标、新闻舆情、基本面、市场环境的贡献度，以及最强看多/看空信号。
 - 盘前、非交易日或未知阶段不得伪造今日盘中走势；quote/daily_bars/technical 存在 stale、fallback、missing、fetch_failed、partial 或 estimated 时，`confidence_level` 不得为高。"""
 
     SYSTEM_PROMPT = """你是一位{market_placeholder}投资分析师，负责生成专业的【决策仪表盘】分析报告。
@@ -2507,14 +2686,6 @@ class GeminiAnalyzer:
             "data_limitations": ["阶段或数据质量限制1", "阶段或数据质量限制2"]
         },
 
-        "signal_attribution": {
-            "technical_indicators": 技术指标贡献度(0-100),
-            "news_sentiment": 新闻舆情贡献度(0-100),
-            "fundamentals": 基本面贡献度(0-100),
-            "market_conditions": 市场环境贡献度(0-100),
-            "strongest_bullish_signal": "最强看多信号名称",
-            "strongest_bearish_signal": "最强看空信号名称"
-        }
     },
 
     "analysis_summary": "100字综合分析摘要",
@@ -2585,7 +2756,6 @@ class GeminiAnalyzer:
 - 只有在接近支撑确认或有效突破压力，且资金流/量价配合时，才能给出买入；接近压力且资金流出时不得追买。
 - 只有在跌破关键支撑、主力资金持续流出或风险显著放大时，才能给出卖出/减仓。
 - 必须输出 `dashboard.phase_decision` 七字段；盘中/午休/临近收盘要给出当前动作、观察条件和下一次检查点。
-- 建议输出可选展示字段 `dashboard.signal_attribution` 六字段；解释推荐理由的构成，包括技术指标、新闻舆情、基本面、市场环境的贡献度，以及最强看多/看空信号。
 - 盘前、非交易日或未知阶段不得伪造今日盘中走势；quote/daily_bars/technical 存在 stale、fallback、missing、fetch_failed、partial 或 estimated 时，`confidence_level` 不得为高。"""
 
     # English templates (REPORT_LANGUAGE=en/ko). They mirror LEGACY_DEFAULT_SYSTEM_PROMPT /
@@ -2670,14 +2840,6 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
             "data_limitations": ["Phase or data-quality limitation 1", "Phase or data-quality limitation 2"]
         },
 
-        "signal_attribution": {
-            "technical_indicators": technical indicator contribution (0-100),
-            "news_sentiment": news sentiment contribution (0-100),
-            "fundamentals": fundamentals contribution (0-100),
-            "market_conditions": market conditions contribution (0-100),
-            "strongest_bullish_signal": "Name of the strongest bullish signal",
-            "strongest_bearish_signal": "Name of the strongest bearish signal"
-        }
     },
 
     "analysis_summary": "Overall analysis summary (about 100 words)",
@@ -2721,7 +2883,6 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 - Only give Buy near a confirmed support or after a valid breakout above resistance, with capital flow/volume confirming; never chase near resistance while capital flows out.
 - Only give Sell/Reduce after a break below key support, persistent main capital outflow, or a clear increase in risk.
 - `dashboard.phase_decision` must contain all seven fields; intraday, lunch break and near the close must give the current action, watch conditions and the next checkpoint.
-- The optional display field `dashboard.signal_attribution` (six fields) is recommended; explain what drives the recommendation, including the contribution of technical indicators, news sentiment, fundamentals and market conditions, and the strongest bullish/bearish signals.
 - Pre-market, on non-trading days or in an unknown phase, never fabricate today's intraday move; when quote/daily_bars/technical is stale, fallback, missing, fetch_failed, partial or estimated, `confidence_level` must not be High."""
 
     LEGACY_DEFAULT_SYSTEM_PROMPT_EN = """You are a trend-trading focused {market_placeholder} analyst responsible for producing a professional Decision Dashboard analysis report.
@@ -2898,8 +3059,17 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
         """Return the runtime config, honoring injected overrides for tests/pipeline."""
         return getattr(self, "_config_override", None) or get_config()
 
-    def _get_skill_prompt_sections(self) -> tuple[str, str, bool]:
-        """Resolve skill instructions + default baseline + prompt mode."""
+    def _get_skill_prompt_sections(
+        self, ma_alignment: Optional[str] = None
+    ) -> tuple[str, str, bool]:
+        """Resolve skill instructions + default baseline + prompt mode.
+
+        DSA v5 P0-8: when the current stock's MA alignment is known, the
+        prompt state is resolved fresh with that alignment (the legacy
+        bull baseline is injected only for a bullish alignment). The
+        per-instance cache is alignment-agnostic, so it is used only when
+        no alignment is supplied.
+        """
         skill_instructions = getattr(self, "_skill_instructions_override", None)
         default_skill_policy = getattr(self, "_default_skill_policy_override", None)
         use_legacy_default_prompt = getattr(self, "_use_legacy_default_prompt_override", None)
@@ -2909,6 +3079,20 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
                 skill_instructions,
                 default_skill_policy,
                 bool(use_legacy_default_prompt) if use_legacy_default_prompt is not None else False,
+            )
+
+        if ma_alignment is not None:
+            from src.agent.factory import resolve_skill_prompt_state
+
+            prompt_state = resolve_skill_prompt_state(
+                self._get_runtime_config(),
+                skills=getattr(self, "_requested_skills", None),
+                ma_alignment=ma_alignment,
+            )
+            return (
+                prompt_state.skill_instructions,
+                prompt_state.default_skill_policy,
+                bool(getattr(prompt_state, "use_legacy_default_prompt", False)),
             )
 
         resolved_state = getattr(self, "_resolved_prompt_state", None)
@@ -2936,12 +3120,19 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
             ),
         )
 
-    def _get_analysis_system_prompt(self, report_language: str, stock_code: str = "") -> str:
+    def _get_analysis_system_prompt(
+        self,
+        report_language: str,
+        stock_code: str = "",
+        ma_alignment: Optional[str] = None,
+    ) -> str:
         """Build the analyzer system prompt with output-language guidance."""
         lang = normalize_report_language(report_language)
         market_role = get_market_role(stock_code, lang)
         market_guidelines = get_market_guidelines(stock_code, lang)
-        skill_instructions, default_skill_policy, use_legacy_default_prompt = self._get_skill_prompt_sections()
+        skill_instructions, default_skill_policy, use_legacy_default_prompt = self._get_skill_prompt_sections(
+            ma_alignment=ma_alignment
+        )
         # Korean reuses the English scaffolding (same as market review / context pack);
         # the Korean output directive is appended below.
         use_english_template = lang in ("en", "ko")
@@ -4338,8 +4529,16 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
         code = context.get('code', 'Unknown')
         config = self._get_runtime_config()
         report_language = normalize_report_language(getattr(config, "report_language", "zh"))
-        system_prompt = self._get_analysis_system_prompt(report_language, stock_code=code)
-        skill_instructions, default_skill_policy, use_legacy_default_prompt = self._get_skill_prompt_sections()
+        # DSA v5 P0-8: pass the current stock's MA alignment so the legacy
+        # bull baseline is injected only for a bullish alignment.
+        trend_analysis = context.get('trend_analysis') if isinstance(context.get('trend_analysis'), dict) else {}
+        ma_alignment = trend_analysis.get('ma_alignment')
+        system_prompt = self._get_analysis_system_prompt(
+            report_language, stock_code=code, ma_alignment=ma_alignment
+        )
+        skill_instructions, default_skill_policy, use_legacy_default_prompt = self._get_skill_prompt_sections(
+            ma_alignment=ma_alignment
+        )
         
         # 请求前增加延时（防止连续请求触发限流）
         request_delay = config.gemini_request_delay
@@ -4661,6 +4860,9 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
         # Structural template language: Korean reuses the English scaffolding and only
         # the final output-language directive differs (#2352).
         english = report_language in ("en", "ko")
+        # DSA v5 P0-8: this prompt only uses use_legacy_default_prompt
+        # (alignment-independent), so the cached no-arg resolution applies;
+        # the bull-baseline gating lives in analyze() / the system prompt.
         _, _, use_legacy_default_prompt = self._get_skill_prompt_sections()
         
         # 优先使用上下文中的股票名称（从 realtime_quote 获取）
@@ -5797,8 +5999,9 @@ Output the complete Decision Dashboard in JSON format."""
                     score_calibration = {}
                     dashboard["decision_score_calibration"] = score_calibration
                 score_calibration.setdefault("guardrail_reason", str(guardrail_reason).strip())
-            # 归一化 signal_attribution（LLM 可能返回字符串/负数/总和≠100）
-            normalize_report_signal_attribution(dashboard)
+            # DSA v5 P0-6: strip signal_attribution (LLM-invented weights
+            # are removed, never normalized or rendered).
+            strip_report_signal_attribution(dashboard)
 
             # 优先使用 AI 返回的股票名称（如果原名称无效或包含代码）
             ai_stock_name = data.get('stock_name')
