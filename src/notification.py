@@ -64,8 +64,6 @@ from bot.models import BotMessage
 from src.utils.sanitize import sanitize_diagnostic_text
 from src.formatters import strip_hidden_markdown_metadata
 from src.utils.data_processing import (
-    signal_attribution_has_content,
-    signal_attribution_weight_items,
     normalize_model_used,
 )
 from src.notification_sender import (
@@ -1602,33 +1600,9 @@ class NotificationService(
                             report_lines.append(f"- {item}")
                         report_lines.append("")
 
-                # ========== 信号归因分析 ==========
-                signal_attr = dashboard.get('signal_attribution', {}) if dashboard else {}
-                if signal_attribution_has_content(signal_attr):
-                    report_lines.extend([
-                        f"### 🎯 {labels['signal_attribution_heading']}",
-                        "",
-                    ])
-                    weight_items = signal_attribution_weight_items(signal_attr)
-                    if weight_items:
-                        report_lines.append(f"**{labels['attribution_weights_label']}**:")
-                        weight_labels = {
-                            "technical_indicators": ("📈", labels['technical_indicators_label']),
-                            "news_sentiment": ("📰", labels['news_sentiment_label']),
-                            "fundamentals": ("📊", labels['fundamentals_label']),
-                            "market_conditions": ("🌐", labels['market_conditions_label']),
-                        }
-                        for key, value in weight_items:
-                            icon, label = weight_labels[key]
-                            report_lines.append(f"- {icon} {label}: {value}%")
-                        report_lines.append("")
-
-                    # 最强信号
-                    if signal_attr.get('strongest_bullish_signal'):
-                        report_lines.append(f"**🐂 {labels['strongest_bullish_signal_label']}**: {signal_attr['strongest_bullish_signal']}")
-                    if signal_attr.get('strongest_bearish_signal'):
-                        report_lines.append(f"**🐻 {labels['strongest_bearish_signal_label']}**: {signal_attr['strongest_bearish_signal']}")
-                    report_lines.append("")
+                # DSA v5 P0-6: signal attribution weights removed. The
+                # weights were invented differently across runs (LLM
+                # fabrication); the section is deleted, not hidden.
 
                 # ========== 多策略综合 ==========
                 strategy_synthesis = normalize_strategy_synthesis_payload(
@@ -2136,36 +2110,7 @@ class NotificationService(
             lines.append(f"| {ideal_buy} | {stop_loss} | {take_profit} |")
             lines.append("")
 
-        # ========== 信号归因分析 ==========
-        signal_attr = dashboard.get('signal_attribution', {}) if dashboard else {}
-        if signal_attribution_has_content(signal_attr):
-            lines.extend([
-                f"### 🎯 {labels.get('signal_attribution_heading', '信号归因分析')}",
-                "",
-            ])
-            # 归因权重
-            weight_items = signal_attribution_weight_items(signal_attr)
-            if weight_items:
-                lines.append(f"**{labels.get('attribution_weights_label', '归因权重')}**:")
-                weight_labels = {
-                    "technical_indicators": ("📈", labels.get('technical_indicators_label', '技术指标')),
-                    "news_sentiment": ("📰", labels.get('news_sentiment_label', '新闻舆情')),
-                    "fundamentals": ("📊", labels.get('fundamentals_label', '基本面')),
-                    "market_conditions": ("🌐", labels.get('market_conditions_label', '市场环境')),
-                }
-                for key, value in weight_items:
-                    icon, label = weight_labels[key]
-                    lines.append(f"- {icon} {label}: {value}%")
-                lines.append("")
-
-            # 最强信号
-            bullish = signal_attr.get('strongest_bullish_signal')
-            bearish = signal_attr.get('strongest_bearish_signal')
-            if bullish:
-                lines.append(f"**🐂 {labels.get('strongest_bullish_signal_label', '最强看多信号')}**: {bullish}")
-            if bearish:
-                lines.append(f"**🐻 {labels.get('strongest_bearish_signal_label', '最强看空信号')}**: {bearish}")
-            lines.append("")
+        # DSA v5 P0-6: signal attribution weights removed (see above).
 
         # 持仓建议
         pos_advice = core.get('position_advice', {}) if core else {}
