@@ -432,7 +432,10 @@ class TestAgentFactorySkillBaseline(unittest.TestCase):
         self.assertFalse(kwargs["use_legacy_default_prompt"])
         skill_manager.activate.assert_called_once_with(["wave_theory"])
 
-    def test_implicit_default_run_keeps_default_skill_policy(self):
+    def test_implicit_default_run_does_not_inject_bull_baseline_without_alignment(self):
+        # DSA v5 P0-8: the bull baseline is injected only when the MA
+        # alignment is bullish. The factory builds the executor without
+        # per-stock context, so an implicit run must not inject it blindly.
         config = SimpleNamespace(
             agent_arch="single",
             agent_skills=[],
@@ -446,7 +449,7 @@ class TestAgentFactorySkillBaseline(unittest.TestCase):
             instructions="bull_trend instructions",
         )
 
-        self.assertIn("严进策略", kwargs["default_skill_policy"])
+        self.assertEqual(kwargs["default_skill_policy"], "")
         self.assertTrue(kwargs["use_legacy_default_prompt"])
         skill_manager.activate.assert_called_once_with(["bull_trend"])
 
@@ -467,7 +470,10 @@ class TestAgentFactorySkillBaseline(unittest.TestCase):
             instructions="bull_trend instructions",
         )
 
-        self.assertIn("严进策略", kwargs["default_skill_policy"])
+        # DSA v5 P0-8: no MA alignment known at factory build time, so
+        # no bull baseline is injected; skill activation still falls back
+        # to the primary default skill.
+        self.assertEqual(kwargs["default_skill_policy"], "")
         self.assertTrue(kwargs["use_legacy_default_prompt"])
         skill_manager.activate.assert_called_once_with(["bull_trend"])
 
@@ -509,7 +515,10 @@ class TestAgentFactorySkillBaseline(unittest.TestCase):
             instructions="bull_trend instructions",
         )
 
-        self.assertIn("严进策略", kwargs["default_skill_policy"])
+        # DSA v5 P0-8: no MA alignment known at factory build time, so
+        # no bull baseline is injected; skill activation still falls back
+        # to the primary default skill.
+        self.assertEqual(kwargs["default_skill_policy"], "")
         self.assertTrue(kwargs["use_legacy_default_prompt"])
         skill_manager.activate.assert_called_once_with(["bull_trend"])
 
