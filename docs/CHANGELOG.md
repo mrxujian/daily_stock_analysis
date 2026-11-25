@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [修复] DSA v5 P0-2：均线/RSI/乖离率只用已收盘日线计算，实时行情不再追加为虚拟日线、也不覆盖最后一根收盘价（`_augment_historical_with_realtime` 改为返回原日线不变）。
+- [修复] DSA v5 P0-3：日线量能手→股换算（`data_provider/volume_units.py`，STAR 直通、ETF 标 unverified），实时量比只在单位为已核验 shares 时计算，0.1–10 倍以外触发人工确认门禁并阻断结论；工作流新增前置检查步，待确认超时或跨下次定时任务时暂停该次运行。
+- [修复] DSA v5 P0-4：新闻面零命中时向模型输入注入固定缺新闻模板（覆盖范围、查询时间、来源状态、零命中证据），不得据此断言“无消息/无利好/无利空”。
+- [修复] DSA v5 P0-7：LLM 数字校验（`validate_llm_numbers`）：模型所述 MA 值与已收盘日线重算值偏差超 0.01 即标“未校验”并阻断发送；RSI 只记录比对，不写死算法、不硬拦（前置条件①未关）；系统趋势评分与 LLM 评分分开展示。
+- [修复] DSA v5 P0-8：技能路由方向优先，`trend_score` 缺失视为未知不默认 50，空头排列不落入 sideways，无技术观点时不回退默认技能；多头基线只在 MA 排列为 bullish 时注入。
+- [修复] DSA v5 P0-6：删除归因权重（prompt schema、归一化、报告渲染、模板、schema 模型与相关测试均移除；LLM 输出残留的 `signal_attribution` 由 `strip_report_signal_attribution` 剥离）。
+- [新功能] DSA v5 P1-1/P1-5：公告风险清单与 ST 硬门槛（东财公告 API，回归样本 070/071/069）：公告只作线索，移出须法院/管理人/监管可核验文书，债务逾期须全额清偿或债权人书面确认解除；门槛未通过时只输出数据状态报告、不出投资结论、不静默停摆；ST 权重只作用于门槛通过后的评分。
+- [改进] DSA v5：`AnalysisResult` 新增 `verification_status`/`send_blocked_reason`，门禁未通过的报告不向任何渠道发送，但仍落盘留存审计轨迹；工作流将 `data/volume_confirmation_state.json` 随 Artifact 留存 30 天。
+
 - [改进] CI 瘦身：PR 仅改文档或 `tests/fixtures/**` 时以 `docs-contract-tests` 替代三分片后端全量测试；`docker-build` 保留运行时输入触发并排除前端测试与 Markdown 改动；前端仅改单元测试文件时 `web-gate` 跳过构建与 Playwright（非 PR 事件触发 `web-gate` 时仍执行完整构建与 Playwright，`docker-build` 与文档契约后端全量在非 PR 事件下保持兜底）。
 
 - [新功能] 新增 DSA 内部因子契约（`FactorDefinition`/`FactorSnapshot`/`CandidatePoolRun`/`CandidateFactorScore`，契约版本 1.0）：将选股 `factor_scores` 映射为带字段版本、来源、数据质量与降级原因的内部结构（#1902 P0）；仅新增 schema 与纯映射函数，不改变现有选股、API、回测与 DecisionSignal 行为。`ScreenResult.created_at` 改为带本地偏移的 ISO 字符串（按部署进程本地时钟换算为 UTC），`pick_to_factor_snapshot` 的显式 `computed_at` 同样归一化；内置引擎来源守卫的作用域已修正，原创的 `factor_mapping.py` 不再被误判为 AlphaSift 派生文件。
