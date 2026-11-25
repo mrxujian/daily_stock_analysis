@@ -173,9 +173,11 @@ class TestAugmentHistoricalWithRealtime(unittest.TestCase):
     @patch("src.core.pipeline.get_market_now")
     @patch("src.core.pipeline.is_market_open", return_value=True)
     @patch("src.core.pipeline.get_market_for_stock", return_value="cn")
-    def test_appends_row_when_last_date_before_today(
+    def test_no_row_appended_when_last_date_before_today(
         self, _mock_market, _mock_open, mock_now
     ) -> None:
+        # DSA v5 P0-2: closed daily bars only. A realtime quote must never
+        # be appended as a virtual daily bar.
         today = date.today()
         # 固定市场时钟为 UTC 当日，使 pipeline 的 market_today 等于 date.today()，
         # 不受 get_market_now 通常使用的市场时区影响（例如 CST=UTC+8）。
@@ -185,29 +187,30 @@ class TestAugmentHistoricalWithRealtime(unittest.TestCase):
         df = _make_historical_df(last_date=today - timedelta(days=1))
         quote = _make_realtime_quote(price=15.72)
         result = self.pipeline._augment_historical_with_realtime(df, quote, "600519")
-        self.assertEqual(len(result), len(df) + 1)
-        last = result.iloc[-1]
-        self.assertEqual(last["close"], 15.72)
-        self.assertEqual(last["date"], today)
+        self.assertEqual(len(result), len(df))
+        self.assertEqual(result.iloc[-1]["date"], today - timedelta(days=1))
 
     @patch("src.core.pipeline.get_market_now")
     @patch("src.core.pipeline.is_market_open", return_value=True)
     @patch("src.core.pipeline.get_market_for_stock", return_value="cn")
-    def test_updates_last_row_when_last_date_is_today(
+    def test_last_row_not_updated_when_last_date_is_today(
         self, _mock_market, _mock_open, mock_now
     ) -> None:
+        # DSA v5 P0-2: the last closed bar keeps its close; a realtime
+        # quote must never overwrite it.
         today = date.today()
-        # 固定市场时钟为当日，使 last_date >= market_today，从而更新最后一行而不是追加。
+        # 固定市场时钟为当日，使 last_date >= market_today。
         # 这可以避免 CI 在 CST 收盘后运行时出现日期边界偏移。
         mock_now.return_value = datetime(
             today.year, today.month, today.day, 10, 0, tzinfo=timezone.utc
         )
         df = _make_historical_df(last_date=today, days=25)
         df.loc[df.index[-1], "date"] = today
+        last_close = float(df.iloc[-1]["close"])
         quote = _make_realtime_quote(price=16.0)
         result = self.pipeline._augment_historical_with_realtime(df, quote, "600519")
         self.assertEqual(len(result), len(df))
-        self.assertEqual(result.iloc[-1]["close"], 16.0)
+        self.assertEqual(float(result.iloc[-1]["close"]), last_close)
 
 
 class TestComputeMaStatus(unittest.TestCase):
@@ -278,11 +281,14 @@ class TestEnhanceContextRealtimeOverride(unittest.TestCase):
         self.assertEqual(enhanced["today"]["data_source"], "realtime:tencent")
         self.assertEqual(enhanced["today"]["realtime_source"], "tencent")
         self.assertIn("price_change_ratio", enhanced)
-        self.assertIn("volume_change_ratio", enhanced)
+        # DSA v5 P0-3: realtime volume unit unverified (no volume_unit on
+        # the quote), so the intraday ratio is not computed.
+        self.assertNotIn("volume_change_ratio", enhanced)
+        self.assertEqual(enhanced["volume_change_ratio_status"], "unverified_unit")
 
     @patch("src.core.pipeline.get_market_now")
     @patch("src.core.pipeline.get_market_for_stock", return_value="cn")
-    def test_tencent_688691_volume_change_ratio_uses_normalized_share_volume(
+    def test_tencent_688691_volume_change_ratio_skipped_when_unit_unverified(
         self, _mock_market, mock_now
     ) -> None:
         today = date.today()
@@ -327,7 +333,10 @@ class TestEnhanceContextRealtimeOverride(unittest.TestCase):
 
         self.assertEqual(enhanced["today"]["volume"], 10931723)
         self.assertEqual(enhanced["today"]["amount"], 1327404280)
-        self.assertEqual(enhanced["volume_change_ratio"], 0.56)
+        # DSA v5 P0-3: the Tencent realtime quote carries no verified
+        # volume_unit, so no intraday ratio is computed from it.
+        self.assertNotIn("volume_change_ratio", enhanced)
+        self.assertEqual(enhanced["volume_change_ratio_status"], "unverified_unit")
         self.assertEqual(enhanced["today"]["date"], today.isoformat())
         self.assertEqual(enhanced["today"]["data_source"], "realtime:tencent")
         self.assertEqual(enhanced["today"]["realtime_source"], "tencent")
@@ -543,7 +552,9 @@ class TestEnhanceContextRealtimeOverride(unittest.TestCase):
         self.assertEqual(enhanced["yesterday"]["date"], "2026-11-12")
         self.assertEqual(enhanced["yesterday"]["close"], 208000.0)
         self.assertEqual(enhanced["price_change_ratio"], -0.12)
-        self.assertEqual(enhanced["volume_change_ratio"], 0.45)
+        # DSA v5 P0-3: realtime volume unit unverified; no ratio.
+        self.assertNotIn("volume_change_ratio", enhanced)
+        self.assertEqual(enhanced["volume_change_ratio_status"], "unverified_unit")
 
         snapshot = GeminiAnalyzer.__new__(GeminiAnalyzer)._build_market_snapshot(enhanced)
         self.assertEqual(snapshot["prev_close"], "208000.00")
@@ -625,7 +636,9 @@ class TestEnhanceContextRealtimeOverride(unittest.TestCase):
 
         self.assertEqual(enhanced["yesterday"]["date"], "2026-11-12")
         self.assertEqual(enhanced["price_change_ratio"], -0.12)
-        self.assertEqual(enhanced["volume_change_ratio"], 0.45)
+        # DSA v5 P0-3: realtime volume unit unverified; no ratio.
+        self.assertNotIn("volume_change_ratio", enhanced)
+        self.assertEqual(enhanced["volume_change_ratio_status"], "unverified_unit")
         self.assertEqual(enhanced["today"]["pct_chg"], -0.12)
 
     def test_yfinance_recomputes_derived_indicators_after_history_override(self) -> None:
@@ -757,7 +770,9 @@ class TestEnhanceContextRealtimeOverride(unittest.TestCase):
 
         self.assertEqual(enhanced["yesterday"]["date"], "2026-11-11")
         self.assertAlmostEqual(enhanced["price_change_ratio"], 0.97, places=2)
-        self.assertAlmostEqual(enhanced["volume_change_ratio"], 1.21, places=2)
+        # DSA v5 P0-3: realtime volume unit unverified; no ratio.
+        self.assertNotIn("volume_change_ratio", enhanced)
+        self.assertEqual(enhanced["volume_change_ratio_status"], "unverified_unit")
 
     def test_session_shift_requires_matching_market_date_evidence(self) -> None:
         now = datetime(2026, 11, 13, 14, 28, tzinfo=ZoneInfo("Asia/Seoul"))
@@ -884,7 +899,9 @@ class TestEnhanceContextRealtimeOverride(unittest.TestCase):
 
                     self.assertEqual(enhanced["yesterday"], context["yesterday"])
                     self.assertEqual(enhanced["price_change_ratio"], 10.0)
-                    self.assertEqual(enhanced["volume_change_ratio"], 1.25)
+                    # DSA v5 P0-3: realtime volume unit unverified; no ratio.
+                    self.assertNotIn("volume_change_ratio", enhanced)
+                    self.assertEqual(enhanced["volume_change_ratio_status"], "unverified_unit")
                     snapshot = GeminiAnalyzer.__new__(GeminiAnalyzer)._build_market_snapshot(enhanced)
                     self.assertEqual(snapshot["prev_close"], "100.00")
                     self.assertEqual(snapshot["change_amount"], "10.00")
@@ -907,7 +924,9 @@ class TestEnhanceContextRealtimeOverride(unittest.TestCase):
             )
         self.assertEqual(enhanced_current["yesterday"]["date"], "2026-11-12")
         self.assertEqual(enhanced_current["price_change_ratio"], -0.12)
-        self.assertEqual(enhanced_current["volume_change_ratio"], 0.45)
+        # DSA v5 P0-3: realtime volume unit unverified; no ratio.
+        self.assertNotIn("volume_change_ratio", enhanced_current)
+        self.assertEqual(enhanced_current["volume_change_ratio_status"], "unverified_unit")
 
         stale_ts_quote = self._kr_005930_quote(provider_timestamp="2026-11-12T15:30:00+09:00")
         with patch("src.core.pipeline.get_market_now", return_value=now):
