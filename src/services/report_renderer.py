@@ -43,8 +43,6 @@ from src.schemas.decision_action import (
 )
 from src.utils.data_processing import (
     normalize_model_used,
-    signal_attribution_has_content,
-    signal_attribution_weight_items,
 )
 
 logger = logging.getLogger(__name__)
@@ -245,8 +243,6 @@ def render(
         "localize_conflict_severity": localize_conflict_severity,
         "normalize_strategy_synthesis_payload": normalize_strategy_synthesis_payload,
         "strategy_invalid_opinion_count": strategy_invalid_opinion_count,
-        "signal_attribution_has_content": signal_attribution_has_content,
-        "signal_attribution_weight_items": signal_attribution_weight_items,
     }
     if extra_context:
         safe_extra_context = dict(extra_context)
