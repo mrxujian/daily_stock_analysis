@@ -56,13 +56,18 @@ class SkillRouter:
                 logger.info("[SkillRouter] regime=%s -> skills: %s", regime, selected)
                 return selected
 
-        default_skills = get_default_router_skill_ids(
-            skill_catalog,
-            max_count=max_count,
-            available_skill_ids=available_ids or None,
+        # DSA v5 P0-8: no technical view, no default skill. When the
+        # regime is unknown (no MA alignment, no usable trend_score),
+        # falling back to the default bull_trend skill produced a
+        # bullish conclusion on a bearish trend. Return an empty list;
+        # the orchestrator treats an empty selection as "no technical
+        # view" instead of silently inheriting a bull bias.
+        logger.info(
+            "[SkillRouter] no regime detected (regime=%s); "
+            "returning empty skill list, no default fallback",
+            regime,
         )
-        logger.info("[SkillRouter] using default skills: %s", default_skills)
-        return default_skills
+        return []
 
     def select_strategies(
         self,
@@ -79,20 +84,39 @@ class SkillRouter:
             raw = op.raw_data or {}
 
             ma_alignment = str(raw.get("ma_alignment", "")).lower()
+            # DSA v5 P0-8: a missing trend_score is "unknown", never a
+            # default 50. A default 50 silently pushed bearish trends
+            # into the sideways branch (35-65) and then into the
+            # bull_trend default skill.
+            trend_score = raw.get("trend_score")
             try:
-                trend_score = float(raw.get("trend_score", 50))
+                trend_score = float(trend_score) if trend_score is not None else None
             except (TypeError, ValueError):
-                trend_score = 50.0
+                trend_score = None
             volume_status = str(raw.get("volume_status", "")).lower()
 
-            if ma_alignment == "bullish" and trend_score >= 70:
+            # Direction first: MA alignment decides the regime; the score
+            # only confirms it when no alignment is available. Bearish
+            # alignment never falls through to sideways, even with a
+            # middling score.
+            if ma_alignment == "bullish":
                 return "trending_up"
-            if ma_alignment == "bearish" and trend_score <= 30:
+            if ma_alignment == "bearish":
                 return "trending_down"
-            if ma_alignment == "neutral" or 35 <= trend_score <= 65:
+            if ma_alignment == "neutral":
                 return "sideways"
-            if volume_status == "heavy" and 30 < trend_score < 70:
-                return "volatile"
+            if trend_score is not None:
+                if trend_score >= 70:
+                    return "trending_up"
+                if trend_score <= 30:
+                    return "trending_down"
+                if 35 <= trend_score <= 65:
+                    return "sideways"
+                if volume_status == "heavy" and 30 < trend_score < 70:
+                    return "volatile"
+            # Alignment unknown and no usable score: regime unknown.
+            # The caller must not fall back to a default skill.
+            return None
 
         if ctx.meta.get("sector_hot"):
             return "sector_hot"
