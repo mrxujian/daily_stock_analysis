@@ -54,6 +54,71 @@ if set(_DISCLOSURES) != set(SUPPORTED_REPORT_LANGUAGES):
     )
 
 
+def missing_news_fixed_template(
+    *,
+    coverage_scope: str,
+    query_time: str,
+    source_available: bool,
+    news_result_count: Optional[int],
+    language: str = "zh",
+) -> str:
+    """Fixed template for missing news evidence (DSA v5 P0-4).
+
+    When no news evidence was received, the model input must carry this
+    template instead of an empty news section: it states the coverage
+    scope, the query time, the source success status and the zero-hit
+    evidence, and it forbids "no news / no positives / no negatives"
+    assertions. The banner disclosure alone does not constrain the model
+    body text, so the template travels inside ``news_context`` itself.
+
+    ``news_result_count``: None means no search channel was configured
+    (search never ran); 0 means the search ran but hit nothing.
+    """
+    if language == "en":
+        source_text = (
+            "search channel configured and query executed"
+            if source_available
+            else "no search channel configured; search never ran"
+        )
+        hit_text = (
+            "query executed but zero hits"
+            if news_result_count == 0
+            else "search never ran"
+        )
+        return (
+            "[News coverage insufficient] No usable news evidence was "
+            "retrieved for this analysis. Do NOT conclude \"no news / no "
+            "positives / no negatives\".\n"
+            f"- Coverage scope: {coverage_scope}\n"
+            f"- Query time: {query_time}\n"
+            f"- Source status: {source_text}\n"
+            f"- Retrieval result: {hit_text}\n"
+            "- Conclusion: the analysis below does not incorporate "
+            "news-dimension evidence; any news-related judgement must be "
+            "marked \"not retrieved / insufficient coverage\"."
+        )
+    source_text = (
+        "已配置搜索渠道并执行检索"
+        if source_available
+        else "未配置搜索渠道，未执行检索"
+    )
+    hit_text = (
+        "执行了检索但零命中"
+        if news_result_count == 0
+        else "未执行检索"
+    )
+    return (
+        "【新闻面覆盖不足】本次分析未检索到可用的新闻面证据，"
+        "不得据此得出“无消息/无利好/无利空”结论。\n"
+        f"- 覆盖范围：{coverage_scope}\n"
+        f"- 查询时间：{query_time}（北京时间）\n"
+        f"- 来源状态：{source_text}\n"
+        f"- 检索结果：{hit_text}\n"
+        "- 结论：以下分析未纳入新闻维度证据；涉及消息面的判断均须标注"
+        "“未检索/覆盖不足”。"
+    )
+
+
 def persisted_news_result_state(
     raw_result: Any,
     context_snapshot: Any = None,
