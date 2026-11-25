@@ -105,21 +105,44 @@ following default risk controls as the shared baseline:
 """
 
 
-def get_default_trading_skill_policy(*, explicit_skill_selection: bool) -> str:
+def get_default_trading_skill_policy(
+    *,
+    explicit_skill_selection: bool,
+    ma_alignment: Optional[str] = None,
+) -> str:
     """Return the legacy default trading baseline only for implicit/default runs.
 
     When a caller explicitly chooses a skill (via request payload or config),
     analysis should follow that selected skill alone instead of silently
     layering the old bull-trend baseline on top.
+
+    DSA v5 P0-8: the baseline is a BULL baseline (it requires MA5 > MA10
+    > MA20 and only trades bullish alignment). It is injected only when
+    the current stock's MA alignment is actually bullish. When the
+    alignment is unknown, bearish or neutral, no baseline is injected:
+    injecting it blindly produced a bullish conclusion on a bearish trend.
     """
     if explicit_skill_selection:
+        return ""
+    if str(ma_alignment or "").strip().lower() != "bullish":
         return ""
     return CORE_TRADING_SKILL_POLICY_ZH
 
 
-def get_default_technical_skill_policy(*, explicit_skill_selection: bool) -> str:
-    """Return the technical-agent baseline only for implicit/default runs."""
+def get_default_technical_skill_policy(
+    *,
+    explicit_skill_selection: bool,
+    ma_alignment: Optional[str] = None,
+) -> str:
+    """Return the technical-agent baseline only for implicit/default runs.
+
+    DSA v5 P0-8: same rule as the trading baseline -- injected only when
+    the current stock's MA alignment is bullish; unknown / bearish /
+    neutral alignment injects nothing.
+    """
     if explicit_skill_selection:
+        return ""
+    if str(ma_alignment or "").strip().lower() != "bullish":
         return ""
     return TECHNICAL_SKILL_RULES_EN
 
