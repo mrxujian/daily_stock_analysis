@@ -71,7 +71,12 @@ from .base import (
 from .realtime_types import (
     UnifiedRealtimeQuote, RealtimeSource,
     get_realtime_circuit_breaker,
-    safe_float, safe_int  # 使用统一的类型转换函数
+    safe_float  # 使用统一的类型转换函数
+)
+from .volume_units import (
+    VOLUME_UNIT_SHARES,
+    VOLUME_UNIT_UNVERIFIED,
+    lots_to_shares,
 )
 
 
@@ -647,6 +652,23 @@ class EfinanceFetcher(BaseFetcher):
             df['high'] = df['close']
             df['low'] = df['close']
             
+        # DSA v5 P0-3: efinance daily volume is in lots (手), not shares,
+        # for A-share stocks. Verified by DSA-UNIT-CHECK-20261125-01
+        # (2026-11-24 daily value 282013 lots == Wind 28,201,300 shares).
+        # Convert to the canonical unit shares (股) here so every
+        # downstream ratio divides like-for-like. STAR Market (688/689)
+        # volumes are already shares and pass through unchanged.
+        # ETF volumes are left untouched: their unit was not part of the
+        # verified check, so they stay marked unverified instead of being
+        # converted on an assumption.
+        if 'volume' in df.columns and not _is_a_share_etf_code(stock_code):
+            df['volume'] = df['volume'].map(
+                lambda v: lots_to_shares(v, stock_code)
+            )
+            df.attrs['volume_unit'] = VOLUME_UNIT_SHARES
+        elif 'volume' in df.columns:
+            df.attrs['volume_unit'] = VOLUME_UNIT_UNVERIFIED
+
         # Fill volume and amount if missing
         if 'volume' not in df.columns:
             df['volume'] = 0
@@ -769,7 +791,13 @@ class EfinanceFetcher(BaseFetcher):
                 price=safe_float(row.get(price_col)),
                 change_pct=safe_float(row.get(pct_col)),
                 change_amount=safe_float(row.get(chg_col)),
-                volume=safe_int(row.get(vol_col)),
+                # DSA v5 P0-3: efinance realtime volume unit is UNVERIFIED
+                # (DSA-UNIT-CHECK-20261125-01 could not fetch it). The
+                # volume is withheld (None) until the unit is verified and
+                # reconciled against the same-day closing daily volume;
+                # an unknown-unit volume must never enter a ratio.
+                volume=None,
+                volume_unit=VOLUME_UNIT_UNVERIFIED,
                 amount=safe_float(row.get(amt_col)),
                 turnover_rate=safe_float(row.get(turn_col)),
                 amplitude=safe_float(row.get(amp_col)),
@@ -856,7 +884,9 @@ class EfinanceFetcher(BaseFetcher):
                 price=price,
                 change_pct=safe_float(data.get("f170")),
                 change_amount=safe_float(data.get("f169")),
-                volume=safe_int(data.get("f47")),
+                # DSA v5 P0-3: realtime volume unit unverified; withheld.
+                volume=None,
+                volume_unit=VOLUME_UNIT_UNVERIFIED,
                 amount=safe_float(data.get("f48")),
                 amplitude=safe_float(data.get("f171")),
                 high=safe_float(data.get("f44")),
@@ -959,7 +989,9 @@ class EfinanceFetcher(BaseFetcher):
                 price=safe_float(row.get(price_col)),
                 change_pct=safe_float(row.get(pct_col)),
                 change_amount=safe_float(row.get(chg_col)),
-                volume=safe_int(row.get(vol_col)),
+                # DSA v5 P0-3: realtime volume unit unverified; withheld.
+                volume=None,
+                volume_unit=VOLUME_UNIT_UNVERIFIED,
                 amount=safe_float(row.get(amt_col)),
                 turnover_rate=safe_float(row.get(turn_col)),
                 amplitude=safe_float(row.get(amp_col)),
