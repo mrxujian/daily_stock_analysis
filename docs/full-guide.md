@@ -1110,23 +1110,11 @@ P5 在个股分析报告的 `dashboard.phase_decision` 中追加阶段化决策�
 
 普通分析与 Agent 分析会在保存历史前复用当次 `market_phase_summary` 和 `analysis_context_pack_overview.data_quality` 执行轻量护栏：核心 quote / daily_bars / technical 数据 stale、fallback、missing、fetch_failed、partial 或 estimated 时，不允许高置信结论；盘前、非交易日或未知阶段不得输出高置信盘中买卖；盘中、午间和临近收盘会检查主结论里的盘后复盘口吻，并把明显的"今日收盘后复盘显示""明日重点关注"类措辞改为阶段安全的观察/等待表述。护栏只补低敏 `phase_context` 和数据限制，不编造观察条件或下一次检查时间；通知摘要、告警、持仓和回测联动留给后续 P6。
 
-#### 信号归因分析（Issue #1742）
+#### 信号归因分析（Issue #1742，已于 DSA v5 移除）
 
-Issue #1742 在个股分析报告的 `dashboard.signal_attribution` 中新增信号归因分析字段：`technical_indicators`、`news_sentiment`、`fundamentals`、`market_conditions`（四个贡献度；有效非零贡献度归一化到 100；全零表示无有效信号）、`strongest_bullish_signal` 和 `strongest_bearish_signal`。该字段解释推荐理由的构成，帮助用户理解 AI 决策的归因权重。
+Issue #1742 曾在个股分析报告的 `dashboard.signal_attribution` 中新增信号归因分析字段：`technical_indicators`、`news_sentiment`、`fundamentals`、`market_conditions`（四个贡献度；有效非零贡献度归一化到 100；全零表示无有效信号）、`strongest_bullish_signal` 和 `strongest_bearish_signal`。该字段解释推荐理由的构成，帮助用户理解 AI 决策的归因权重。
 
-信号归因分析在所有报告渲染路径中同步展示：
-- `generate_dashboard_report()`（默认通知报告）
-- `generate_single_stock_report()`（单股推送报告）
-- `templates/report_markdown.j2`（Jinja2 模板）
-- `HistoryService._generate_single_stock_markdown()`（Web 历史抽屉）
-
-归一化函数在 `_parse_response()` 和 `parse_dashboard_json()` 中显式调用，确保：
-- 字符串百分比转为 int（如 `"35%"` → `35`）
-- 负数转为 0
-- 总和≠100 时归一化为总和=100
-- 值裁剪到 [0, 100] 范围
-
-`signal_attribution` 是可选展示字段（非必填）。缺失不会失败完整性检查，也不会写入 `missing` 列表或触发补全 prompt；存在时会被归一化并在支持的报告路径展示。
+DSA v5 P0-6 已删除该字段：两次试跑证明归因权重是模型现编的（同一份数据两次结论相反），不再可信。删除范围：prompt schema 与指令、归一化函数（改为 `strip_report_signal_attribution` 剥离残留键）、全部报告渲染路径（通知、单股推送、Jinja2 模板、Web 历史抽屉）、schema 模型与相关测试。LLM 输出中残留的 `signal_attribution` 会在解析时被剥离，永不进入报告。
 
 #### 告警、持仓和历史联动（Issue #1386 P6）
 
