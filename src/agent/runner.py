@@ -50,7 +50,7 @@ from src.core.stock_execution_context import (
     track_stock_worker_abandonment,
 )
 from src.llm.usage import should_persist_usage_telemetry
-from src.utils.data_processing import normalize_report_signal_attribution
+from src.utils.data_processing import strip_report_signal_attribution
 from src.storage import persist_llm_usage as _persist_usage
 
 logger = logging.getLogger(__name__)
@@ -174,7 +174,7 @@ def parse_dashboard_json(content: str) -> Optional[Dict[str, Any]]:
 def _finalize_dashboard_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Sanitize reserved fields before running normal dashboard normalization."""
     sanitized = sanitize_agent_dashboard_payload(payload)
-    normalize_report_signal_attribution(sanitized)
+    strip_report_signal_attribution(sanitized)
     return sanitized
 
 
