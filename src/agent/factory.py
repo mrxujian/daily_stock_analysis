@@ -493,8 +493,17 @@ def get_skill_manager(config=None):
     return copy.deepcopy(_SKILL_MANAGER_PROTOTYPE)
 
 
-def resolve_skill_prompt_state(config=None, skills: Optional[List[str]] = None) -> SkillPromptState:
-    """Resolve active skills and prompt fragments for analyzer / agent entrypoints."""
+def resolve_skill_prompt_state(
+    config=None,
+    skills: Optional[List[str]] = None,
+    ma_alignment: Optional[str] = None,
+) -> SkillPromptState:
+    """Resolve active skills and prompt fragments for analyzer / agent entrypoints.
+
+    ``ma_alignment`` is the current stock's MA alignment (e.g. "bullish").
+    DSA v5 P0-8: the legacy bull baseline is injected only when the
+    alignment is bullish; unknown alignment injects nothing.
+    """
     if config is None:
         from src.config import get_config
         config = get_config()
@@ -543,9 +552,11 @@ def resolve_skill_prompt_state(config=None, skills: Optional[List[str]] = None) 
         skill_instructions=skill_manager.get_skill_instructions(),
         default_skill_policy=get_default_trading_skill_policy(
             explicit_skill_selection=not use_legacy_default_prompt,
+            ma_alignment=ma_alignment,
         ),
         technical_skill_policy=get_default_technical_skill_policy(
             explicit_skill_selection=not use_legacy_default_prompt,
+            ma_alignment=ma_alignment,
         ),
     )
 
