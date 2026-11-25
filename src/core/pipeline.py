@@ -13,6 +13,7 @@ A股自选股智能分析系统 - 核心分析流水线
 
 import logging
 import inspect
+import os
 import threading
 import time
 from pathlib import Path
@@ -28,7 +29,7 @@ import pandas as pd
 from src.config import FUNDAMENTAL_STAGE_TIMEOUT_SECONDS_DEFAULT, get_config, Config
 from src.storage import get_db
 from data_provider import DataFetcherManager
-from data_provider.base import is_bse_code, normalize_stock_code
+from data_provider.base import is_bse_code, is_st_stock, normalize_stock_code
 from data_provider.realtime_types import ChipDistribution
 from src.analyzer import (
     GeminiAnalyzer,
@@ -37,6 +38,7 @@ from src.analyzer import (
     normalize_chip_structure_availability,
     populate_decision_action_fields,
     stabilize_decision_with_structure,
+    validate_llm_numbers,
     validate_sniper_price_sanity,
 )
 from src.notification import NotificationService, NotificationChannel
@@ -65,7 +67,20 @@ from src.agent.news_evidence import (
     get_current_news_evidence,
     reset_news_evidence_scope,
 )
-from src.services.empty_news import news_evidence_present
+from src.services.empty_news import (
+    missing_news_fixed_template,
+    news_evidence_present,
+)
+from src.services.volume_confirmation import request_confirmation
+from src.services.announcement_risk import (
+    build_risk_list,
+    evaluate_st_hard_gate,
+    fetch_announcements,
+)
+from data_provider.volume_units import (
+    is_verified_shares_unit,
+    volume_ratio_needs_confirmation,
+)
 from src.formatters import strip_hidden_markdown_metadata
 from src.phase_decision_guardrail import apply_phase_decision_guardrails
 from src.services.daily_market_context import (
@@ -850,6 +865,7 @@ class StockAnalysisPipeline:
 
             # Step 3: 趋势分析（基于交易理念）— 在 Agent 分支之前执行，供两条路径共用
             trend_result: Optional[TrendAnalysisResult] = None
+            latest_closed_bar_date: Optional[str] = None
             try:
                 from src.services.history_loader import get_frozen_target_date
                 _mkt = get_market_for_stock(normalize_stock_code(code))
@@ -865,6 +881,22 @@ class StockAnalysisPipeline:
                             df, realtime_quote, code, market=market
                         )
                     trend_result = self.trend_analyzer.analyze(df, code)
+                    # DSA v5 P0-1: data_as_of is the latest CLOSED daily
+                    # bar. Timeliness is judged against it downstream: the
+                    # analysis is valid only when the latest bar is a closed
+                    # trading day, not today while the session is open.
+                    # (Stored in a local here: `context` is only built in
+                    # Step 5; it is copied into it there.)
+                    try:
+                        last_bar = df["date"].max()
+                        last_bar_date = (
+                            last_bar.date()
+                            if hasattr(last_bar, "date")
+                            else last_bar
+                        )
+                        latest_closed_bar_date = str(last_bar_date)
+                    except Exception:
+                        pass
                     logger.info(
                         f"{log_stock_name}({code}) trend analysis: {trend_result.trend_status.name}, "
                         f"buy_signal={trend_result.buy_signal.name}, score={trend_result.signal_score}"
@@ -978,6 +1010,40 @@ class StockAnalysisPipeline:
                     else persisted_intelligence_context
                 )
 
+            # DSA v5 P0-4: when no news evidence was received, the model
+            # input must carry the fixed missing-news template (coverage
+            # scope, query time, source status, zero-hit evidence). The
+            # banner disclosure alone does not constrain the model body,
+            # which previously asserted "no major positives in the last
+            # 3 days" on an empty news_context.
+            if not news_evidence_present(
+                news_result_count,
+                social_evidence_context,
+                persisted_intelligence_context,
+            ):
+                from zoneinfo import ZoneInfo
+
+                query_time = datetime.now(ZoneInfo("Asia/Shanghai")).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                template = missing_news_fixed_template(
+                    coverage_scope=f"{stock_name}({code}) 近期新闻与公告",
+                    query_time=query_time,
+                    source_available=bool(
+                        self.search_service is not None
+                        and self.search_service.is_available
+                    ),
+                    news_result_count=news_result_count,
+                    language=getattr(self.config, "report_language", "zh"),
+                )
+                news_context = (
+                    f"{news_context}\n\n{template}" if news_context else template
+                )
+                logger.info(
+                    f"{log_stock_name}({code}) no news evidence; "
+                    "fixed missing-news template injected into model input"
+                )
+
             # Step 5: 获取分析上下文（技术面数据）
             self._emit_progress(58, f"{stock_name}：正在整理分析上下文")
             context = self._get_analysis_context_with_market_fallback(
@@ -1000,7 +1066,13 @@ class StockAnalysisPipeline:
                     'today': {},
                     'yesterday': {}
                 }
-            
+
+            # DSA v5 P0-1: carry the latest closed bar date (Step 3) into
+            # the context so _enhance_context copies it to enhanced_context
+            # (enhanced = context.copy()).
+            if latest_closed_bar_date:
+                context["data_as_of"] = latest_closed_bar_date
+
             # Step 6: 增强上下文数据（添加实时行情、筹码、趋势分析结果、股票名称）
             enhanced_context = self._enhance_context(
                 context, 
@@ -1032,6 +1104,36 @@ class StockAnalysisPipeline:
             if isinstance(market_structure_context, dict):
                 enhanced_context["market_structure_context"] = market_structure_context
             
+            # DSA v5 P1-1 / P1-5: announcement risk list + ST hard gate.
+            # Free source: Eastmoney announcements API (verified 2026-11-25).
+            # The risk list tracks open items by event validity, not by a
+            # 7-day window. For ST tickers the announcement block is an
+            # independent hard gate: coverage failure -> data-status report
+            # only, no investment conclusion, no silent stall.
+            st_hard_gate: Dict[str, Any] = {}
+            announcement_risk_items: List[Any] = []
+            if is_st_stock(stock_name):
+                announcements, coverage = fetch_announcements(code)
+                announcement_risk_items = build_risk_list(code, announcements)
+                gate = evaluate_st_hard_gate(
+                    code, coverage, announcement_risk_items
+                )
+                st_hard_gate = {
+                    "passed": gate.passed,
+                    "output_mode": gate.output_mode,
+                    "reason": gate.reason,
+                    "risk_items": [item.to_dict() for item in gate.risk_items],
+                    "missing_samples": gate.missing_samples,
+                }
+                enhanced_context["st_hard_gate"] = st_hard_gate
+                enhanced_context["announcement_risk_list"] = [
+                    item.to_dict() for item in announcement_risk_items
+                ]
+                logger.info(
+                    f"{log_stock_name}({code}) ST hard gate: "
+                    f"passed={gate.passed} mode={gate.output_mode}"
+                )
+
             # Step 7: 调用 AI 分析（传入增强的上下文和新闻）
             (
                 analysis_context_pack_summary,
@@ -1072,60 +1174,75 @@ class StockAnalysisPipeline:
             self._emit_progress(64, f"{stock_name}：正在请求 LLM 生成报告")
             if _is_current_stock_cancelled():
                 return None
-            llm_started_at = time.monotonic()
-            try:
-                record_llm_run_started(
-                    model=getattr(self.config, "litellm_model", None),
-                    call_type="analysis",
+            # DSA v5 condition 4: ST hard gate failed -> data-status report
+            # only. No LLM call, no investment conclusion, no silent stall.
+            # The data-status result flows through the same Step 7.5/7.6/7.7
+            # verification, history save and (blocked) notification path.
+            result = None
+            if st_hard_gate.get("output_mode") == "data_status_only":
+                result = self._build_data_status_result(
+                    code=code,
+                    stock_name=stock_name,
+                    report_language=report_language,
+                    st_hard_gate=st_hard_gate,
+                    news_result_count=news_result_count,
+                    trend_result=trend_result,
                 )
-                result = self.analyzer.analyze(
-                    enhanced_context,
-                    news_context=news_context,
-                    progress_callback=self._emit_progress,
-                    stream_progress_callback=_on_llm_stream,
-                    analysis_context_pack_summary=analysis_context_pack_summary,
-                )
-                if _is_current_stock_cancelled():
-                    return None
-                llm_duration_ms = int((time.monotonic() - llm_started_at) * 1000)
-                if result is not None:
-                    # 交给展示层区分「未配置渠道」「检索零命中」和「正常命中」。
-                    # 该值此前只进了诊断快照，报告层拿不到。
-                    result.news_result_count = news_result_count
-                    # 三路来源逐个登记，不看拼好的 news_context 整段：
-                    # format_intel_report() 零命中时仍输出占位文本，整段永远非空，
-                    # 拿它判定会把「搜了但一条没拿到」误判成有证据。
-                    result.news_evidence_present = news_evidence_present(
-                        news_result_count,
-                        social_evidence_context,
-                        persisted_intelligence_context,
+            if result is None:
+                llm_started_at = time.monotonic()
+                try:
+                    record_llm_run_started(
+                        model=getattr(self.config, "litellm_model", None),
+                        call_type="analysis",
                     )
-                record_llm_run(
-                    success=bool(result and getattr(result, "success", True)),
-                    model=getattr(result, "model_used", None) if result else None,
-                    call_type="analysis",
-                    duration_ms=llm_duration_ms,
-                    error_type=(
-                        None
-                        if result and getattr(result, "success", True)
-                        else "AnalysisResultError"
-                    ),
-                    error_message=(
-                        getattr(result, "error_message", None)
-                        if result and not getattr(result, "success", True)
-                        else ("LLM returned empty result" if result is None else None)
-                    ),
-                )
-            except Exception as exc:
-                record_llm_run(
-                    success=False,
-                    model=getattr(self.config, "litellm_model", None),
-                    call_type="analysis",
-                    duration_ms=int((time.monotonic() - llm_started_at) * 1000),
-                    error_type=type(exc).__name__,
-                    error_message=exc,
-                )
-                raise
+                    result = self.analyzer.analyze(
+                        enhanced_context,
+                        news_context=news_context,
+                        progress_callback=self._emit_progress,
+                        stream_progress_callback=_on_llm_stream,
+                        analysis_context_pack_summary=analysis_context_pack_summary,
+                    )
+                    if _is_current_stock_cancelled():
+                        return None
+                    llm_duration_ms = int((time.monotonic() - llm_started_at) * 1000)
+                    if result is not None:
+                        # 交给展示层区分「未配置渠道」「检索零命中」和「正常命中」。
+                        # 该值此前只进了诊断快照，报告层拿不到。
+                        result.news_result_count = news_result_count
+                        # 三路来源逐个登记，不看拼好的 news_context 整段：
+                        # format_intel_report() 零命中时仍输出占位文本，整段永远非空，
+                        # 拿它判定会把「搜了但一条没拿到」误判成有证据。
+                        result.news_evidence_present = news_evidence_present(
+                            news_result_count,
+                            social_evidence_context,
+                            persisted_intelligence_context,
+                        )
+                    record_llm_run(
+                        success=bool(result and getattr(result, "success", True)),
+                        model=getattr(result, "model_used", None) if result else None,
+                        call_type="analysis",
+                        duration_ms=llm_duration_ms,
+                        error_type=(
+                            None
+                            if result and getattr(result, "success", True)
+                            else "AnalysisResultError"
+                        ),
+                        error_message=(
+                            getattr(result, "error_message", None)
+                            if result and not getattr(result, "success", True)
+                            else ("LLM returned empty result" if result is None else None)
+                        ),
+                    )
+                except Exception as exc:
+                    record_llm_run(
+                        success=False,
+                        model=getattr(self.config, "litellm_model", None),
+                        call_type="analysis",
+                        duration_ms=int((time.monotonic() - llm_started_at) * 1000),
+                        error_type=type(exc).__name__,
+                        error_message=exc,
+                    )
+                    raise
 
             # Step 7.5: 填充分析时的价格信息到 result
             if result:
@@ -1182,6 +1299,11 @@ class StockAnalysisPipeline:
                 if trend_result is not None:
                     sniper_context = {**enhanced_context, "trend_result": self._safe_to_dict(trend_result)}
                 validate_sniper_price_sanity(result, sniper_context)
+                # DSA v5: number verification / confirmation block / score
+                # separation / timeliness gates; blocks sending on failure.
+                self._apply_dsa_v5_verification_gates(
+                    result, code, stock_name, enhanced_context, trend_result
+                )
 
             if result:
                 self._append_daily_data_source(result, context, analysis_target)
@@ -1457,19 +1579,67 @@ class StockAnalysisPipeline:
                             )
                     except (TypeError, ValueError):
                         pass
+                # DSA v5 P0-3: a realtime volume may only enter the ratio
+                # when its unit is verified shares. efinance realtime volume
+                # is unverified (withheld as None), so the ratio keeps the
+                # daily-based value computed upstream instead of being
+                # overwritten by a mixed-unit division (the 100x bug:
+                # 0.62x read as 62.07x). An out-of-band ratio only raises
+                # an alert + manual confirmation; it is never a unit test.
                 if vol is not None and enhanced.get('yesterday'):
-                    yest_vol = enhanced['yesterday'].get('volume') if isinstance(
-                        enhanced['yesterday'], dict
-                    ) else None
-                    if yest_vol is not None:
-                        try:
-                            yv = float(yest_vol)
-                            if yv > 0:
-                                enhanced['volume_change_ratio'] = round(
-                                    float(vol) / yv, 2
-                                )
-                        except (TypeError, ValueError):
-                            pass
+                    realtime_unit = getattr(realtime_quote, 'volume_unit', None)
+                    if not is_verified_shares_unit(realtime_unit):
+                        enhanced['volume_change_ratio_status'] = 'unverified_unit'
+                        logger.warning(
+                            "[%s] Volume ratio skipped: realtime volume unit "
+                            "unverified (%s); keeping daily-based ratio",
+                            enhanced.get('code', ''),
+                            realtime_unit,
+                        )
+                    else:
+                        yest_vol = enhanced['yesterday'].get('volume') if isinstance(
+                            enhanced['yesterday'], dict
+                        ) else None
+                        if yest_vol is not None:
+                            try:
+                                yv = float(yest_vol)
+                                if yv > 0:
+                                    ratio = round(float(vol) / yv, 2)
+                                    enhanced['volume_change_ratio'] = ratio
+                                    enhanced['volume_change_ratio_status'] = 'ok'
+                                    if volume_ratio_needs_confirmation(ratio):
+                                        # Record the confirmation request;
+                                        # a persistence failure must not
+                                        # break the run -- the in-memory
+                                        # pending flag still blocks sending.
+                                        try:
+                                            record = request_confirmation(
+                                                str(enhanced.get('code', '')),
+                                                trade_date=str(market_today),
+                                                volume_change_ratio=ratio,
+                                                reason=(
+                                                    "volume change ratio outside "
+                                                    "0.1-10x band; manual "
+                                                    "confirmation required (Rio, "
+                                                    "Wind daily K-line)"
+                                                ),
+                                                state_path=self._volume_confirmation_state_path(),
+                                            )
+                                            enhanced['volume_confirmation_record'] = (
+                                                record.to_dict()
+                                            )
+                                        except Exception as exc:
+                                            logger.warning(
+                                                "[%s] Volume confirmation state "
+                                                "write failed: %s",
+                                                enhanced.get('code', ''),
+                                                exc,
+                                            )
+                                        enhanced['volume_confirmation_status'] = (
+                                            'pending_manual_confirmation'
+                                        )
+                            except (TypeError, ValueError):
+                                pass
 
         # ETF/index flag for analyzer prompt (Fixes #274)
         enhanced['is_index_etf'] = SearchService.is_index_or_etf(
@@ -2109,6 +2279,14 @@ class StockAnalysisPipeline:
                         )
                     )
                 validate_sniper_price_sanity(result, initial_context)
+                # DSA v5: number verification / confirmation block / score
+                # separation / timeliness gates; blocks sending on failure.
+                # (ST hard gate + volume confirmation are evaluated on the
+                # non-agent path; here only the number / score / timeliness
+                # checks apply.)
+                self._apply_dsa_v5_verification_gates(
+                    result, code, stock_name, initial_context, trend_result
+                )
 
             if result:
                 self._append_daily_data_source(
@@ -2499,6 +2677,176 @@ class StockAnalysisPipeline:
             return
         target_context["cross_asset_context"] = safe_context
         target_context["cross_asset_context_summary"] = prompt_section
+
+    def _build_data_status_result(
+        self,
+        code: str,
+        stock_name: str,
+        report_language: str,
+        st_hard_gate: Dict[str, Any],
+        news_result_count: Optional[int],
+        trend_result: Optional[TrendAnalysisResult] = None,
+    ) -> AnalysisResult:
+        """
+        Build a data-status-only result (DSA v5 condition 4).
+
+        Used when the ST hard gate fails (announcement PoC not passed or
+        the announcements API failed at runtime): the run still produces
+        a report, but it carries data status / coverage insufficiency
+        only -- no investment conclusion, no score to act on, and the
+        notification path is blocked. Never silently stalls, never
+        disables the gate to keep producing conclusions.
+        """
+        language = normalize_report_language(report_language)
+        is_zh = language == "zh"
+        reason = str(st_hard_gate.get("reason", ""))
+        risk_items = st_hard_gate.get("risk_items", [])
+        missing = st_hard_gate.get("missing_samples", [])
+        if is_zh:
+            title = "数据状态报告（仅数据状态，不出投资结论）"
+            advice = "数据覆盖不足，不出投资结论"
+            trend = "数据不可用"
+            body = (
+                f"ST 硬门槛未通过：{reason}。"
+                f"未覆盖回归样本：{', '.join(missing) if missing else '无'}。"
+                f"待处理风险事项 {len(risk_items)} 项。"
+                "本次报告仅说明数据状态与覆盖不足情况，不构成任何操作建议。"
+            )
+        else:
+            title = "Data status report only (no investment conclusion)"
+            advice = "Insufficient data coverage; no investment conclusion"
+            trend = "Data unavailable"
+            body = (
+                f"ST hard gate not passed: {reason}. "
+                f"Missing regression samples: {', '.join(missing) if missing else 'none'}. "
+                f"{len(risk_items)} open risk items. "
+                "This report states data status and coverage insufficiency only; "
+                "it is not an investment recommendation."
+            )
+        result = AnalysisResult(
+            code=code,
+            name=stock_name,
+            sentiment_score=50,
+            trend_prediction=trend,
+            operation_advice=advice,
+            confidence_level=localize_confidence_level("low", language),
+            report_language=language,
+            success=True,
+            data_sources="eastmoney_announcements_api",
+            model_used=None,
+        )
+        result.technical_analysis = body
+        result.risk_warning = reason
+        result.key_points = [title, body]
+        result.news_result_count = news_result_count
+        result.news_evidence_present = False
+        result.verification_status = "data_status_only"
+        result.send_blocked_reason = reason
+        result.dashboard = {
+            "data_perspective": {
+                "st_hard_gate": st_hard_gate,
+                "output_mode": "data_status_only",
+            }
+        }
+        return result
+
+    def _apply_dsa_v5_verification_gates(
+        self,
+        result: AnalysisResult,
+        code: str,
+        stock_name: str,
+        enhanced_context: Dict[str, Any],
+        trend_result: Optional[TrendAnalysisResult] = None,
+    ) -> None:
+        """
+        DSA v5 verification gates, applied after sniper-point sanity
+        (P0-7 number verification, P0-3 confirmation block, P0-5 score
+        separation, P0-1 timeliness). Sets verification_status and
+        send_blocked_reason on the result; the notification path blocks
+        sending whenever send_blocked_reason is set. The verification
+        record is written into dashboard["data_perspective"] so the
+        report and the audit trail both carry it.
+        """
+        # P0-7: LLM number verification. MA / sniper points hard-fail at
+        # 0.01; RSI is only recorded -- its algorithm is not unified
+        # (precondition 1 open), so it must not be hard-coded or hard-fail.
+        number_check = validate_llm_numbers(
+            result, enhanced_context, trend_result
+        )
+        # P0-5: system trend score (deterministic scoring tables) vs LLM
+        # score (model judgement), shown separately, never mixed.
+        system_score = (
+            getattr(trend_result, "signal_score", None)
+            if trend_result is not None
+            else None
+        )
+        # P0-1: data_as_of is the latest closed daily bar. If it is today
+        # while the session is still open, the bar is partial -> block.
+        data_as_of = enhanced_context.get("data_as_of")
+        timeliness_issue = None
+        if data_as_of:
+            try:
+                as_of_date = datetime.strptime(str(data_as_of), "%Y-%m-%d").date()
+                market = get_market_for_stock(normalize_stock_code(code))
+                today = get_market_now(market).date()
+                if as_of_date == today and is_market_open(market, today):
+                    timeliness_issue = (
+                        "latest daily bar is today's partial bar "
+                        "(session still open); indicators use closed bars only"
+                    )
+            except (ValueError, TypeError):
+                pass
+
+        status = "verified"
+        blocked_reason = None
+        if getattr(result, "verification_status", None) == "data_status_only":
+            status = "data_status_only"
+            blocked_reason = getattr(result, "send_blocked_reason", None)
+        elif number_check["status"] == "failed":
+            status = "unverified"
+            blocked_reason = number_check["reason"]
+        elif timeliness_issue is not None:
+            status = "unverified"
+            blocked_reason = timeliness_issue
+        elif (
+            enhanced_context.get("volume_confirmation_status")
+            == "pending_manual_confirmation"
+        ):
+            status = "blocked_pending_confirmation"
+            blocked_reason = (
+                "volume change ratio outside 0.1-10x band; "
+                "manual confirmation pending (Rio, Wind daily K-line)"
+            )
+        result.verification_status = status
+        result.send_blocked_reason = blocked_reason
+
+        dash = result.dashboard if isinstance(result.dashboard, dict) else {}
+        dp = dash.get("data_perspective")
+        if not isinstance(dp, dict):
+            dp = {}
+        dp["number_validation"] = number_check
+        dp["score_separation"] = {
+            "system_trend_score": system_score,
+            "llm_sentiment_score": result.sentiment_score,
+            "note": (
+                "system trend score is deterministic (scoring tables); "
+                "LLM score is a model judgement; the two are never mixed"
+            ),
+        }
+        if data_as_of is not None:
+            dp["data_as_of"] = str(data_as_of)
+        dash["data_perspective"] = dp
+        result.dashboard = dash
+        if blocked_reason:
+            result.risk_warning = (
+                f"{result.risk_warning}\n{blocked_reason}"
+                if result.risk_warning
+                else blocked_reason
+            )
+            logger.info(
+                f"{stock_name}({code}) verification gate: "
+                f"status={status}, blocked={blocked_reason}"
+            )
 
     def _agent_result_to_analysis_result(
         self,
@@ -3123,6 +3471,19 @@ class StockAnalysisPipeline:
         return False
 
     @staticmethod
+    def _volume_confirmation_state_path() -> str:
+        """State file for pending volume-confirmation requests (DSA v5 P0-3).
+
+        The workflow pre-check step reads this file from the checkout
+        before the next run starts; a pending/timed-out request pauses
+        that run instead of letting it auto-run unconfirmed.
+        """
+        return os.environ.get(
+            "DSA_VOLUME_CONFIRMATION_STATE",
+            "data/volume_confirmation_state.json",
+        )
+
+    @staticmethod
     def _compute_ma_status(close: float, ma5: float, ma10: float, ma20: float) -> str:
         """
         Compute MA alignment status from price and MA values.
@@ -3151,76 +3512,25 @@ class StockAnalysisPipeline:
         market: Optional[str] = None,
     ) -> pd.DataFrame:
         """
-        使用当日实时行情补齐历史 OHLCV，用于盘中 MA 计算。
-        Issue #234：技术指标使用实时价格，而不是沿用昨日收盘价。
+        DSA v5 P0-2: MA, RSI and deviation are computed ONLY from closed
+        daily bars. A realtime quote must never be appended as a virtual
+        daily bar, and must never overwrite the last closed bar's close:
+        doing so (Issue #234 behaviour) silently shifted MA5/MA10/MA20
+        whenever the run happened before the close (e.g. 2026-11-25 00:00
+        appended the not-yet-open day's realtime price 1.08 as a new bar).
+
+        The realtime price stays available as a timestamped observation
+        field on the enhanced context (``enhanced['today']`` carries
+        ``is_estimated``); it simply no longer enters the daily series
+        used for indicator computation. This function therefore returns
+        the frame unchanged. Kept as a method so existing call sites and
+        tests keep compiling; the contract is now "closed bars only".
         """
-        if df is None or df.empty or 'close' not in df.columns:
-            return df
-        if realtime_quote is None:
-            return df
-        price = getattr(realtime_quote, 'price', None)
-        if price is None or not (isinstance(price, (int, float)) and price > 0):
-            return df
-
-        # 非交易日可跳过实时补齐；异常情况下保持失败开放。
-        enable_realtime_tech = getattr(
-            self.config, 'enable_realtime_technical_indicators', True
+        logger.info(
+            "[%s] Realtime quote kept out of daily bars (DSA v5 P0-2): "
+            "MA/RSI use closed daily bars only",
+            code,
         )
-        if not enable_realtime_tech:
-            return df
-        if market is None:
-            market = get_market_for_stock(code)
-        market_today = get_market_now(market).date()
-        if market and not is_market_open(market, market_today):
-            return df
-
-        last_val = df['date'].max()
-        last_date = (
-            last_val.date() if hasattr(last_val, 'date') else
-            (last_val if isinstance(last_val, date) else pd.Timestamp(last_val).date())
-        )
-        yesterday_close = float(df.iloc[-1]['close']) if len(df) > 0 else price
-        open_p = getattr(realtime_quote, 'open_price', None) or getattr(
-            realtime_quote, 'pre_close', None
-        ) or yesterday_close
-        high_p = getattr(realtime_quote, 'high', None) or price
-        low_p = getattr(realtime_quote, 'low', None) or price
-        vol = getattr(realtime_quote, 'volume', None) or 0
-        amt = getattr(realtime_quote, 'amount', None)
-        pct = getattr(realtime_quote, 'change_pct', None)
-
-        if last_date >= market_today:
-            # 使用实时收盘价更新最后一行；先复制，避免修改调用方传入的 df。
-            df = df.copy()
-            idx = df.index[-1]
-            df.loc[idx, 'close'] = price
-            if open_p is not None:
-                df.loc[idx, 'open'] = open_p
-            if high_p is not None:
-                df.loc[idx, 'high'] = high_p
-            if low_p is not None:
-                df.loc[idx, 'low'] = low_p
-            if vol:
-                df.loc[idx, 'volume'] = vol
-            if amt is not None:
-                df.loc[idx, 'amount'] = amt
-            if pct is not None:
-                df.loc[idx, 'pct_chg'] = pct
-        else:
-            # 追加一行虚拟的当日实时 K 线。
-            new_row = {
-                'code': code,
-                'date': market_today,
-                'open': open_p,
-                'high': high_p,
-                'low': low_p,
-                'close': price,
-                'volume': vol,
-                'amount': amt if amt is not None else 0,
-                'pct_chg': pct if pct is not None else 0,
-            }
-            new_df = pd.DataFrame([new_row])
-            df = pd.concat([df, new_df], ignore_index=True)
         return df
 
     def _build_context_snapshot(
@@ -4084,6 +4394,17 @@ class StockAnalysisPipeline:
         fallback_code: Optional[str] = None,
     ) -> None:
         """发送单股通知，供直接单股入口和批量串行推送共用。"""
+        # DSA v5: a result blocked by the verification gates (number
+        # unverified / confirmation pending / data-status only) is never
+        # sent to any channel. The report file is still saved locally by
+        # the caller for the audit trail; only the send is blocked.
+        blocked_reason = getattr(result, "send_blocked_reason", None)
+        if blocked_reason:
+            logger.info(
+                f"[{getattr(result, 'code', None) or fallback_code or 'unknown'}] "
+                f"notification blocked by DSA v5 verification gate: {blocked_reason}"
+            )
+            return
         stock_code = getattr(result, "code", None) or fallback_code or "unknown"
         notify_lock = getattr(self, "_single_stock_notify_lock", None)
         if notify_lock is None:
