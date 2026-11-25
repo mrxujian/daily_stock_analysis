@@ -979,24 +979,11 @@ P5 adds a phase-aware decision block under `dashboard.phase_decision` for indivi
 
 Regular analysis and Agent analysis now apply lightweight guardrails before history is saved, using the current `market_phase_summary` and `analysis_context_pack_overview.data_quality`. If core quote / daily_bars / technical data is stale, fallback, missing, fetch_failed, partial, or estimated, high-confidence conclusions are capped. Pre-market, non-trading, or unknown phases must not emit high-confidence intraday buy/sell actions. Intraday, lunch-break, and near-close outputs are scanned for post-market recap wording such as "after today's close" or "focus tomorrow" in the main conclusion and action fields, and obvious violations are replaced with phase-safe wait/watch wording. The guardrail only fills low-sensitivity `phase_context` and data limitations; it does not invent watch conditions or next-check times. Notification summaries, alerts, holdings, and backtest linkage remain later P6 work.
 
-### Signal Attribution Analysis (Issue #1742)
+### Signal Attribution Analysis (Issue #1742, removed in DSA v5)
 
-Issue #1742 adds a signal attribution analysis block under `dashboard.signal_attribution` for individual stock analysis reports: `technical_indicators`, `news_sentiment`, `fundamentals`, `market_conditions` (four contribution values; valid non-zero values are normalized to 100; all-zero means no effective signal), `strongest_bullish_signal`, and `strongest_bearish_signal`. This field explains the composition of recommendation reasons, helping users understand the attribution weights of AI decisions.
+Issue #1742 added a signal attribution analysis block under `dashboard.signal_attribution` for individual stock analysis reports: `technical_indicators`, `news_sentiment`, `fundamentals`, `market_conditions` (four contribution values; valid non-zero values are normalized to 100; all-zero means no effective signal), `strongest_bullish_signal`, and `strongest_bearish_signal`. This field explained the composition of recommendation reasons, helping users understand the attribution weights of AI decisions.
 
-Signal attribution analysis is rendered in all report paths:
-- `generate_dashboard_report()` (default notification report)
-- `generate_single_stock_report()` (single-stock push report)
-- `templates/report_markdown.j2` (Jinja2 template)
-- `HistoryService._generate_single_stock_markdown()` (Web history drawer)
-
-Normalization functions are explicitly called in `_parse_response()` and `parse_dashboard_json()` to ensure:
-- String percentages are converted to int (e.g., `"35%"` → `35`)
-- Negative numbers are clamped to 0
-- Non-zero valid values with sum ≠ 100 are normalized to sum = 100
-- All-zero values are preserved as 0 to mean no effective signal
-- Values are clamped to [0, 100]
-
-`signal_attribution` is an optional display field, not a required integrity field. Missing it does not fail integrity checks, is not recorded in the `missing` list, and does not trigger a completion prompt; when present, it is normalized and rendered by supported report paths.
+DSA v5 P0-6 removed this field: two trial runs proved the attribution weights were invented by the model (opposite conclusions from the same data), so they are no longer trusted. Removed from: prompt schemas and instructions, the normalizer (replaced by `strip_report_signal_attribution`, which strips any leftover key), all report rendering paths (notifications, single-stock push, the Jinja2 template, the Web history drawer), the schema model, and the related tests. A leftover `signal_attribution` in LLM output is stripped at parse time and never reaches a report.
 
 ### Alerts, Portfolio, and History Linkage (Issue #1386 P6)
 
