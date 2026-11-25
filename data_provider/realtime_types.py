@@ -141,6 +141,11 @@ class UnifiedRealtimeQuote:
     
     # === 量价指标（部分源可能缺失）===
     volume: Optional[int] = None            # 成交量（股，与历史日线口径一致）
+    # Volume unit contract (DSA v5 P0-3): "shares" only when explicitly
+    # verified; "unverified" (or None) means the unit is unknown and the
+    # volume must not enter any ratio. efinance realtime volume is
+    # unverified (DSA-UNIT-CHECK-20261125-01 could not fetch it).
+    volume_unit: Optional[str] = None      # 成交量单位：shares / lots / unverified
     amount: Optional[float] = None          # 成交额（元）
     volume_ratio: Optional[float] = None    # 量比
     turnover_rate: Optional[float] = None   # 换手率(%)
@@ -174,7 +179,7 @@ class UnifiedRealtimeQuote:
         optional_fields = [
             'fetched_at', 'provider_timestamp', 'quote_date', 'is_stale', 'stale_seconds',
             'fallback_from', 'market', 'currency', 'data_quality', 'missing_fields',
-            'price', 'change_pct', 'change_amount', 'volume', 'amount',
+            'price', 'change_pct', 'change_amount', 'volume', 'volume_unit', 'amount',
             'volume_ratio', 'turnover_rate', 'amplitude',
             'open_price', 'high', 'low', 'pre_close',
             'pe_ratio', 'pb_ratio', 'total_mv', 'circ_mv',
