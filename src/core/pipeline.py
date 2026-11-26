@@ -71,7 +71,10 @@ from src.services.empty_news import (
     missing_news_fixed_template,
     news_evidence_present,
 )
-from src.services.volume_confirmation import request_confirmation
+from src.services.volume_confirmation import (
+    request_confirmation,
+    touch_pending_confirmation,
+)
 from src.services.announcement_risk import (
     build_risk_list,
     evaluate_st_hard_gate,
@@ -662,6 +665,19 @@ class StockAnalysisPipeline:
         try:
             if _is_current_stock_cancelled():
                 return None
+            # DSA v5 P0-3 cross-run persistence: re-evaluate any pending
+            # volume confirmation so the workflow write-back step has a
+            # state change to commit. A stamp failure must never break
+            # the analysis (bookkeeping only).
+            try:
+                touch_pending_confirmation(
+                    self._volume_confirmation_state_path(),
+                    run_id=os.environ.get("GITHUB_RUN_ID"),
+                )
+            except Exception as exc:  # noqa: BLE001 - bookkeeping only
+                logger.warning(
+                    "Volume confirmation state touch failed: %s", exc
+                )
             portfolio_context = getattr(self, "portfolio_context", None)
             if not isinstance(portfolio_context, dict):
                 portfolio_context = None

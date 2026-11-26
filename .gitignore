@@ -54,7 +54,8 @@ env/
 .cursorrules
 
 # 数据和日志
-/data/
+/data/*
+!/data/volume_confirmation_state.json
 /.llm_usage_hmac_secret
 **/.llm_usage_hmac_secret
 logs/

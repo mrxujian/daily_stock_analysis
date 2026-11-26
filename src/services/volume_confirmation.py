@@ -56,6 +56,13 @@ class VolumeConfirmationRequest:
     confirmed_at: Optional[str] = None
     confirmed_by: Optional[str] = None
     evidence: Optional[str] = None
+    # Re-evaluation stamp: last run that saw this request still pending.
+    # The status is never changed by stamping, so the pre-check pause
+    # decision is unaffected; the stamp only makes the pipeline produce
+    # a state change on every run while a request is pending, so the
+    # workflow write-back step has a real change to commit.
+    last_seen_at: Optional[str] = None  # ISO 8601 with offset, Asia/Shanghai
+    last_seen_run_id: Optional[str] = None  # GitHub run id, if any
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -74,6 +81,8 @@ class VolumeConfirmationRequest:
             confirmed_at=data.get("confirmed_at"),
             confirmed_by=data.get("confirmed_by"),
             evidence=data.get("evidence"),
+            last_seen_at=data.get("last_seen_at"),
+            last_seen_run_id=data.get("last_seen_run_id"),
         )
 
 
@@ -230,5 +239,37 @@ def confirm_request(
         "Volume confirmation recorded: code=%s by=%s",
         record.code,
         confirmed_by,
+    )
+    return record
+
+
+def touch_pending_confirmation(
+    state_path: str,
+    *,
+    run_id: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> Optional[VolumeConfirmationRequest]:
+    """Re-evaluate a pending request and record when it was last seen.
+
+    Called once per analysis run. Only pending requests are stamped; the
+    status is never changed here (a pending request whose window expired
+    must stay pending so the workflow pre-check pauses the next run).
+    Stamping makes the pipeline produce a state change on every run while
+    a request is pending, so the workflow write-back step has a real
+    change to commit to the repo. Returns the stamped record, or None
+    when there is no pending request (nothing is written).
+    """
+    record = load_confirmation_state(state_path)
+    if record is None or record.status != STATUS_PENDING:
+        return None
+    current = now or _now_shanghai()
+    record.last_seen_at = current.isoformat()
+    if run_id is not None:
+        record.last_seen_run_id = str(run_id)
+    save_confirmation_state(state_path, record)
+    logger.info(
+        "Volume confirmation pending request re-evaluated: code=%s run_id=%s",
+        record.code,
+        record.last_seen_run_id,
     )
     return record

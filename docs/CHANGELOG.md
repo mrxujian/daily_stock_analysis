@@ -10,8 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 - [修复] LLM 单次调用超时重试与 fallback（`_call_litellm_impl`）：单次调用超时 90 秒（`LLM_CALL_TIMEOUT_SECONDS`），超时后同一模型最多重试 3 次（含首次，指数退避），3 次都超时再走已配置的 fallback 模型；限流错不激进重试，单股 300 秒上限不动。
-- [修复] DSA v5 P0-2：均线/RSI/乖离率只用已收盘日线计算，实时行情不再追加为虚拟日线、也不覆盖最后一根收盘价（`_augment_historical_with_realtime` 改为返回原日线不变）。
-- [修复] DSA v5 P0-3：日线量能手→股换算（`data_provider/volume_units.py`，STAR 直通、ETF 标 unverified），实时量比只在单位为已核验 shares 时计算，0.1–10 倍以外触发人工确认门禁并阻断结论；工作流新增前置检查步，待确认超时或跨下次定时任务时暂停该次运行。
+- [修复] DSA v5 P0-2：均线/RSI/乖离率只用已收盘日线计算，实时行情不再追加为虚拟日线、也不覆盖最后一根收盘价（`_augment_historical_with_realtime` 改为返回原日线不变）。- [修复] DSA v5 P0-3：日线量能手→股换算（`data_provider/volume_units.py`，STAR 直通、ETF 标 unverified），实时量比只在单位为已核验 shares 时计算，0.1–10 倍以外触发人工确认门禁并阻断结论；工作流新增前置检查步，待确认超时或跨下次定时任务时暂停该次运行。
+- [新功能] DSA v5 P0-3 跨轮回写：量能确认 state（`data/volume_confirmation_state.json`）由工作流回写仓库（内置 token 配 `contents:write`，串行并发组＋推送重试；回写失败且待确认未决时显式失败、不静默丢失）；待确认请求每轮被重评时打上 `last_seen_at`／`last_seen_run_id` 戳记，状态不变；`data/` 的 gitignore 只放行该 state 文件。
 - [修复] DSA v5 P0-4：新闻面零命中时向模型输入注入固定缺新闻模板（覆盖范围、查询时间、来源状态、零命中证据），不得据此断言“无消息/无利好/无利空”。
 - [修复] DSA v5 P0-7：LLM 数字校验（`validate_llm_numbers`）：模型所述 MA 值与已收盘日线重算值偏差超 0.01 即标“未校验”并阻断发送；RSI 只记录比对，不写死算法、不硬拦（前置条件①未关）；系统趋势评分与 LLM 评分分开展示。
 - [修复] DSA v5 P0-8：技能路由方向优先，`trend_score` 缺失视为未知不默认 50，空头排列不落入 sideways，无技术观点时不回退默认技能；多头基线只在 MA 排列为 bullish 时注入。

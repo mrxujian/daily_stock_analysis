@@ -31,6 +31,10 @@ concurrency:
 jobs:
   analyze:
     runs-on: ubuntu-latest
+    # The write-back step below commits the volume confirmation state to
+    # the repo with the built-in token; no PAT is needed.
+    permissions:
+      contents: write
     # 兼容误将 STOCK_LIST 配到同名 Environment variables 的场景；
     # 推荐位置仍是 Settings -> Secrets and variables -> Actions -> Repository variables。
     environment: STOCK_LIST
@@ -595,6 +599,61 @@ jobs:
           else
             python main.py $FORCE_RUN_ARG
           fi
+      
+      - name: 回写量能确认 state（DSA v5 P0-3 跨轮持久化）
+        # The pre-check step of the NEXT run reads this file from the
+        # checkout, so a pending confirmation must be committed to the
+        # repo, not only uploaded as an artifact. Commits only when the
+        # file changed. Runs even if the analysis step failed, because a
+        # failed run may still have raised a confirmation request.
+        # Runs are serialized by the workflow-level concurrency group, so
+        # a same-file conflict from another run cannot happen; the push
+        # retry below only covers a manual commit landing in between.
+        if: always() && github.ref == 'refs/heads/main'
+        run: |
+          set -e
+          STATE_FILE="data/volume_confirmation_state.json"
+          if [ ! -f "$STATE_FILE" ]; then
+            echo "No volume confirmation state file; nothing to persist."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$STATE_FILE"
+          if ! git diff --cached --name-only | grep -qx "$STATE_FILE"; then
+            if git check-ignore -q "$STATE_FILE"; then
+              echo "::error::Volume confirmation state file is git-ignored; cannot persist (check .gitignore exception)."
+              PENDING=$(python -c "import json; print(json.load(open('$STATE_FILE')).get('status',''))" 2>/dev/null || echo "")
+              if [ "$PENDING" = "pending" ]; then
+                exit 1
+              fi
+              exit 0
+            fi
+            echo "Volume confirmation state unchanged; nothing to commit."
+            exit 0
+          fi
+          git commit -m "chore: persist volume confirmation state (run ${{ github.run_id }})"
+          PUSHED=0
+          for i in 1 2 3; do
+            if git push origin HEAD:main; then
+              PUSHED=1
+              break
+            fi
+            echo "Push attempt $i failed; fetching and rebasing before retry."
+            git fetch origin main
+            git rebase origin/main || break
+            sleep 5
+          done
+          if [ "$PUSHED" != "1" ]; then
+            PENDING=$(python -c "import json; print(json.load(open('$STATE_FILE')).get('status',''))" 2>/dev/null || echo "")
+            if [ "$PENDING" = "pending" ]; then
+              echo "::error::Failed to persist a PENDING volume confirmation state to the repo after 3 attempts; the next run will not see the pause. The state file is preserved in this run's artifacts for manual recovery."
+              exit 1
+            fi
+            echo "::warning::Failed to persist a non-pending volume confirmation state; the next run will re-evaluate from the last committed state."
+            exit 0
+          fi
+          echo "Volume confirmation state persisted to main."
       
       - name: 上传分析报告
         uses: actions/upload-artifact@v6
