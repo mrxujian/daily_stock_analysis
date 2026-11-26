@@ -13,6 +13,7 @@ import sys
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
+from typing import Any, Dict
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
@@ -1019,6 +1020,145 @@ class TestEnhanceContextRealtimeOverride(unittest.TestCase):
                 market_phase_context=phase_intraday,
             )
         self.assertEqual(enhanced_existing["yesterday"]["date"], "2026-11-12")
+
+
+    @patch("src.core.pipeline.get_market_now")
+    @patch("src.core.pipeline.get_market_for_stock", return_value="cn")
+    def test_tencent_quote_without_date_uses_pre_close_for_snapshot(self, _mock_market, mock_now) -> None:
+        # Regression test for the 2026-11-26 midday report: a Tencent
+        # quote carries pre_close but no provider-side date, so the
+        # yesterday promotion does not fire; the market snapshot must
+        # still show the true prev close (11-25, 1.14), not the stale
+        # 11-24 bar (1.08).
+        now = datetime(2026, 11, 26, 12, 44, tzinfo=ZoneInfo("Asia/Shanghai"))
+        mock_now.return_value = now
+        phase = build_market_phase_context(market="cn", current_time=now).to_dict()
+        self.assertEqual(phase.get("phase"), "lunch_break")
+        context = {
+            "code": "600491",
+            "date": "2026-11-25",
+            "today": {
+                "date": "2026-11-25", "close": 1.14, "open": 1.14,
+                "high": 1.14, "low": 1.08, "volume": 68237500,
+            },
+            "yesterday": {"date": "2026-11-24", "close": 1.08, "volume": 28200000},
+        }
+        quote = UnifiedRealtimeQuote(
+            code="600491",
+            name="ST龙元",
+            source=RealtimeSource.TENCENT,
+            price=1.10,
+            change_pct=-3.51,
+            change_amount=-0.04,
+            pre_close=1.14,
+            open_price=1.12,
+            high=1.14,
+            low=1.08,
+            volume=28756400,
+            turnover_rate=1.88,
+            volume_ratio=1.36,
+        )
+        trend = TrendAnalysisResult(
+            code="600491",
+            trend_status=TrendStatus.BEAR,
+            ma5=1.114,
+            ma10=1.155,
+            ma20=1.228,
+        )
+        enhanced = self.pipeline._enhance_context(
+            context, quote, None, trend, "ST龙元",
+            fundamental_context={"status": "not_supported"},
+            market_phase_context=phase,
+        )
+        # The yesterday promotion does not fire for dateless Tencent
+        # quotes (pinned behaviour): the baseline is preserved.
+        self.assertEqual(enhanced["yesterday"]["date"], "2026-11-24")
+        self.assertEqual(enhanced["realtime"]["pre_close"], 1.14)
+        snapshot = GeminiAnalyzer.__new__(GeminiAnalyzer)._build_market_snapshot(enhanced)
+        self.assertEqual(snapshot["prev_close"], "1.14")
+        self.assertEqual(snapshot["change_amount"], "-0.04")
+        self.assertEqual(snapshot["pct_chg"], "-3.51%")
+
+
+class TestMarketSnapshotPrevClose(unittest.TestCase):
+    """_build_market_snapshot uses one prev-close source for prev_close,
+    change_amount and pct_chg (DSA prev-close lag fix)."""
+
+    @staticmethod
+    def _snapshot(context: Dict[str, Any]) -> Dict[str, Any]:
+        return GeminiAnalyzer.__new__(GeminiAnalyzer)._build_market_snapshot(context)
+
+    def test_midday_overlay_uses_quote_pre_close(self) -> None:
+        # Exact case from the 2026-11-26 midday report: daily bars end at
+        # 11-25 (1.14), yesterday is the 11-24 bar (1.08), the realtime
+        # quote for the 11-26 session has price 1.10 and pre_close 1.14.
+        snapshot = self._snapshot({
+            "code": "600491",
+            "date": "2026-11-26",
+            "today": {
+                "date": "2026-11-26", "close": 1.10, "open": 1.12,
+                "high": 1.14, "low": 1.08, "pct_chg": -3.51,
+                "is_estimated": True, "data_source": "realtime:tencent",
+            },
+            "yesterday": {"date": "2026-11-24", "close": 1.08},
+            "realtime": {"price": 1.10, "pre_close": 1.14, "source": "tencent"},
+        })
+        self.assertEqual(snapshot["prev_close"], "1.14")
+        self.assertEqual(snapshot["change_amount"], "-0.04")
+        self.assertEqual(snapshot["pct_chg"], "-3.51%")
+
+    def test_premarket_overlay_uses_quote_pre_close(self) -> None:
+        # 09:23 pre-market report: price 1.14 (prev close, no trading
+        # yet), pct 0.00%, yesterday still the 11-24 bar.
+        snapshot = self._snapshot({
+            "code": "600491",
+            "date": "2026-11-26",
+            "today": {
+                "date": "2026-11-26", "close": 1.14, "open": 1.14,
+                "high": 1.14, "low": 1.14, "pct_chg": 0.0,
+                "is_estimated": True, "data_source": "realtime:tencent",
+            },
+            "yesterday": {"date": "2026-11-24", "close": 1.08},
+            "realtime": {"price": 1.14, "pre_close": 1.14, "source": "tencent"},
+        })
+        self.assertEqual(snapshot["prev_close"], "1.14")
+        self.assertEqual(snapshot["change_amount"], "0.00")
+        self.assertEqual(snapshot["pct_chg"], "0.00%")
+
+    def test_post_close_daily_bar_uses_yesterday_close(self) -> None:
+        # After close the daily bar is the current session: today 11-26
+        # close 1.09, yesterday 11-25 close 1.14, no overlay.
+        snapshot = self._snapshot({
+            "code": "600491",
+            "date": "2026-11-26",
+            "today": {
+                "date": "2026-11-26", "close": 1.09, "open": 1.12,
+                "high": 1.14, "low": 1.08, "pct_chg": -4.39,
+            },
+            "yesterday": {"date": "2026-11-25", "close": 1.14},
+            "realtime": {},
+        })
+        self.assertEqual(snapshot["prev_close"], "1.14")
+        self.assertEqual(snapshot["change_amount"], "-0.05")
+        self.assertEqual(snapshot["pct_chg"], "-4.39%")
+
+    def test_overlay_without_pre_close_falls_back_to_yesterday(self) -> None:
+        # Undated quotes without pre_close (HK adapter) keep the old
+        # behaviour: prev_close from the previous daily bar.
+        snapshot = self._snapshot({
+            "code": "HK00700",
+            "date": "2026-11-12",
+            "today": {
+                "date": "2026-11-12", "close": 110.0, "open": 110.0,
+                "high": 110.0, "low": 110.0, "pct_chg": 10.0,
+                "is_estimated": True, "data_source": "realtime:akshare_em",
+            },
+            "yesterday": {"date": "2026-11-11", "close": 100.0},
+            "realtime": {"price": 110.0, "source": "akshare_em"},
+        })
+        self.assertEqual(snapshot["prev_close"], "100.00")
+        self.assertEqual(snapshot["change_amount"], "10.00")
+        self.assertEqual(snapshot["pct_chg"], "10.00%")
 
 
 if __name__ == "__main__":

@@ -5793,7 +5793,22 @@ Output the complete Decision Dashboard in JSON format."""
         realtime = context.get('realtime', {}) or {}
         yesterday = context.get('yesterday', {}) or {}
 
-        prev_close = yesterday.get('close')
+        # Single prev-close source for the whole snapshot. When the
+        # realtime overlay is active (today is an estimated intraday bar),
+        # the quote's own pre_close is the previous trading day's close
+        # for the session being quoted; the daily-bar `yesterday` can lag
+        # one day behind the overlay because its promotion requires
+        # provider-side date evidence that Tencent/Sina quotes never
+        # carry, so reading prev_close from `yesterday` alone prints the
+        # close from two sessions ago while pct_chg (from the quote) is
+        # computed against the true prev close. When no overlay is active,
+        # fall back to the previous daily bar.
+        if today.get('is_estimated') is True or today.get('isEstimated') is True:
+            prev_close = realtime.get('pre_close')
+            if prev_close in (None, 0):
+                prev_close = yesterday.get('close')
+        else:
+            prev_close = yesterday.get('close')
         close = today.get('close')
         high = today.get('high')
         low = today.get('low')

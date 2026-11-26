@@ -1442,6 +1442,7 @@ class StockAnalysisPipeline:
                 'name': getattr(realtime_quote, 'name', ''),
                 'price': getattr(realtime_quote, 'price', None),
                 'change_pct': getattr(realtime_quote, 'change_pct', None),
+                'pre_close': getattr(realtime_quote, 'pre_close', None),
                 'volume_ratio': volume_ratio,
                 'volume_ratio_desc': self._describe_volume_ratio(volume_ratio) if volume_ratio else '无数据',
                 'turnover_rate': getattr(realtime_quote, 'turnover_rate', None),

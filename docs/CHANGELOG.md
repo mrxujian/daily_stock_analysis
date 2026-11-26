@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [修复] 报告「当日行情」表昨收滞后一日：盘中实时覆盖生效时，快照的昨收改取实时行情自身的 pre_close（上一交易日收盘价），涨跌额与涨跌幅与同一昨收一致；无 pre_close（如港股 undated 报价）时回退到上一日线收盘价；不改 yesterday 基线提升逻辑（其提升门仍须 provider 侧日期证据）。
 - [修复] LLM 单次调用超时重试与 fallback（`_call_litellm_impl`）：单次调用超时 90 秒（`LLM_CALL_TIMEOUT_SECONDS`），超时后同一模型最多重试 3 次（含首次，指数退避），3 次都超时再走已配置的 fallback 模型；限流错不激进重试，单股 300 秒上限不动。
 - [修复] DSA v5 P0-2：均线/RSI/乖离率只用已收盘日线计算，实时行情不再追加为虚拟日线、也不覆盖最后一根收盘价（`_augment_historical_with_realtime` 改为返回原日线不变）。- [修复] DSA v5 P0-3：日线量能手→股换算（`data_provider/volume_units.py`，STAR 直通、ETF 标 unverified），实时量比只在单位为已核验 shares 时计算，0.1–10 倍以外触发人工确认门禁并阻断结论；工作流新增前置检查步，待确认超时或跨下次定时任务时暂停该次运行。
 - [新功能] DSA v5 P0-3 跨轮回写：量能确认 state（`data/volume_confirmation_state.json`）由工作流回写仓库（内置 token 配 `contents:write`，串行并发组＋推送重试；回写失败且待确认未决时显式失败、不静默丢失）；待确认请求每轮被重评时打上 `last_seen_at`／`last_seen_run_id` 戳记，状态不变；`data/` 的 gitignore 只放行该 state 文件。
