@@ -1342,6 +1342,9 @@ class Config:
     # === 系统配置 ===
     max_workers: int = 3  # 低并发防封禁
     per_stock_timeout_seconds: int = 300  # 单股超时隔离上限（秒，0 表示不限时）
+    llm_call_timeout_seconds: float = 90.0  # LLM 单次调用超时（秒，0 表示不限时、沿用单股预算）
+    llm_call_max_attempts: int = 3  # LLM 单次调用同一模型最多尝试次数（含首次，最小 1）
+    llm_call_retry_backoff_seconds: float = 2.0  # LLM 调用超时重试基础退避（秒，指数退避）
     debug: bool = False
     http_proxy: Optional[str] = None  # HTTP 代理 (例如: http://127.0.0.1:10809)
     https_proxy: Optional[str] = None # HTTPS 代理
@@ -2372,6 +2375,24 @@ class Config:
                 300,
                 field_name='PER_STOCK_TIMEOUT_SECONDS',
                 minimum=0,
+            ),
+            llm_call_timeout_seconds=parse_env_float(
+                os.getenv('LLM_CALL_TIMEOUT_SECONDS'),
+                90.0,
+                field_name='LLM_CALL_TIMEOUT_SECONDS',
+                minimum=0.0,
+            ),
+            llm_call_max_attempts=parse_env_int(
+                os.getenv('LLM_CALL_MAX_ATTEMPTS'),
+                3,
+                field_name='LLM_CALL_MAX_ATTEMPTS',
+                minimum=1,
+            ),
+            llm_call_retry_backoff_seconds=parse_env_float(
+                os.getenv('LLM_CALL_RETRY_BACKOFF_SECONDS'),
+                2.0,
+                field_name='LLM_CALL_RETRY_BACKOFF_SECONDS',
+                minimum=0.0,
             ),
             debug=os.getenv('DEBUG', 'false').lower() == 'true',
             config_validate_mode=os.getenv('CONFIG_VALIDATE_MODE', 'warn').lower(),

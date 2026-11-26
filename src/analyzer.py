@@ -40,7 +40,7 @@ from src.config import (
     get_explicit_llm_channel_model_provider,
     resolve_news_window_days,
 )
-from src.core.stock_execution_context import is_current_stock_cancelled, raise_if_stock_cancelled
+from src.core.stock_execution_context import get_current_stock_cancellation, is_current_stock_cancelled, raise_if_stock_cancelled
 from src.llm.hermes import (
     HERMES_CHANNEL_NAME,
     build_hermes_redaction_values,
@@ -4098,6 +4098,41 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
             return result
         return result.text, result.model, result.usage
 
+    def _is_timeout_like_error(self, exc: BaseException) -> bool:
+        """Return True when an LLM call failure looks like a hang/timeout.
+
+        Only timeout-like failures are retried on the same model. Cancellations
+        (the per-stock budget is gone) and rate limits are never retried here:
+        a cancellation must propagate, and a rate limit keeps the existing
+        fall-through-to-next-model behaviour.
+        """
+        if type(exc).__name__ == "CancelledError":
+            return False
+        if isinstance(exc, TimeoutError):
+            return True
+        if type(exc).__name__ in {
+            "Timeout",
+            "APITimeoutError",
+            "TimeoutException",
+            "ReadTimeout",
+            "ConnectTimeout",
+            "ConnectTimeoutError",
+            "RequestTimeout",
+        }:
+            return True
+        message = str(exc).lower()
+        return "timed out" in message or "timed-out" in message or "timeout" in message
+
+    def _remaining_stock_budget_seconds(self) -> Optional[float]:
+        """Return seconds left in the per-stock budget, or None when unbounded."""
+        token = get_current_stock_cancellation()
+        if token is None:
+            return None
+        try:
+            return float(token.remaining_seconds())
+        except Exception:
+            return None
+
     def _call_litellm_impl(
         self,
         prompt: str,
@@ -4115,6 +4150,10 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
         (which handles per-model key selection, load balancing, and retries).
         In legacy mode, the primary model may use the Router while fallback
         models fall back to direct litellm.completion().
+
+        A single hung call is bounded by the configured per-call timeout and
+        retried on the same model (up to the configured attempt count) before
+        falling through to the next configured model.
 
         Args:
             prompt: User prompt text.
@@ -4138,6 +4177,38 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
         requested_temperature = generation_config.get('temperature', 0.7)
         requested_timeout = generation_config.get("timeout")
 
+        # Per-call timeout/retry budget (config-driven). A hung call must fail
+        # fast on its own timeout so the same model can be retried and the
+        # configured fallback model still gets a chance inside the per-stock
+        # budget; without this, one hung call consumes the whole budget.
+        try:
+            per_call_timeout = float(getattr(config, "llm_call_timeout_seconds", 90.0) or 0.0)
+        except (TypeError, ValueError):
+            per_call_timeout = 90.0
+        try:
+            max_attempts = max(1, int(getattr(config, "llm_call_max_attempts", 3) or 1))
+        except (TypeError, ValueError):
+            max_attempts = 3
+        try:
+            retry_backoff_base = max(0.0, float(getattr(config, "llm_call_retry_backoff_seconds", 2.0) or 0.0))
+        except (TypeError, ValueError):
+            retry_backoff_base = 2.0
+        # Effective single-call timeout: the configured per-call ceiling,
+        # unless the caller asked for less; 0 disables the ceiling and leaves
+        # the call bounded only by the per-stock budget.
+        call_timeout: Optional[float] = per_call_timeout if per_call_timeout > 0 else None
+        if requested_timeout not in (None, ""):
+            try:
+                requested_timeout_value = float(requested_timeout)
+            except (TypeError, ValueError):
+                requested_timeout_value = None
+            if requested_timeout_value is not None and requested_timeout_value > 0:
+                call_timeout = (
+                    min(requested_timeout_value, call_timeout)
+                    if call_timeout is not None
+                    else requested_timeout_value
+                )
+
         models_to_try = [config.litellm_model] + (config.litellm_fallback_models or [])
         models_to_try = [m for m in models_to_try if m]
 
@@ -4150,7 +4221,14 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
         last_usage: Dict[str, Any] = {}
         effective_system_prompt = system_prompt or self.TEXT_SYSTEM_PROMPT
         router_model_names = set(get_configured_llm_models(config.llm_model_list))
-        for model in models_to_try:
+        # Retry a hung call on the same model before falling through to the
+        # next configured model: one hung call must not consume the whole
+        # per-stock budget. Only timeout-like failures are retried; anything
+        # else (including rate limits) keeps the existing fall-through.
+        pending_models = list(models_to_try)
+        attempts_by_model: Dict[str, int] = {}
+        while pending_models:
+            model = pending_models[0]
             raise_if_stock_cancelled()
             last_model = model
             origins = route_deployment_origins(config.llm_model_list, model)
@@ -4199,8 +4277,8 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
                     ],
                     "max_tokens": max_tokens,
                 }
-                if requested_timeout not in (None, ""):
-                    call_kwargs["timeout"] = requested_timeout
+                if call_timeout is not None:
+                    call_kwargs["timeout"] = call_timeout
                 uses_router = (
                     (use_channel_router and self._router and model in router_model_names)
                     or (self._router and model == config.litellm_model and not use_channel_router)
@@ -4237,8 +4315,8 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
                 )
                 hint_result = apply_prompt_cache_hints(call_kwargs, route_context, config)
                 call_kwargs = hint_result.call_kwargs
-                if requested_timeout not in (None, ""):
-                    call_kwargs["timeout"] = requested_timeout
+                if call_timeout is not None:
+                    call_kwargs["timeout"] = call_timeout
                 if hint_result.diagnostics:
                     logger.debug("[PromptCache] %s", hint_result.diagnostics)
 
@@ -4376,6 +4454,28 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
                 safe_error = self._sanitize_litellm_exception_text(e, config=config, model=model)
                 logger.warning("[LiteLLM] %s failed: %s", model, safe_error)
                 last_error = RuntimeError(f"{type(e).__name__}: {safe_error}")
+                attempts = attempts_by_model.get(model, 0) + 1
+                attempts_by_model[model] = attempts
+                remaining = self._remaining_stock_budget_seconds()
+                if (
+                    self._is_timeout_like_error(e)
+                    and attempts < max_attempts
+                    and (remaining is None or remaining > 5.0)
+                ):
+                    backoff = retry_backoff_base * (2 ** (attempts - 1))
+                    if remaining is not None:
+                        backoff = min(backoff, max(0.0, remaining - 5.0))
+                    logger.warning(
+                        "[LiteLLM] %s call timed out (attempt %d/%d), retrying in %.1fs",
+                        model,
+                        attempts,
+                        max_attempts,
+                        backoff,
+                    )
+                    if backoff > 0:
+                        time.sleep(backoff)
+                    continue
+                pending_models.pop(0)
                 continue
 
         raise _AllModelsFailedError(
