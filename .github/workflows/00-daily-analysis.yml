@@ -59,7 +59,30 @@ jobs:
       - name: 创建必要目录
         run: |
           mkdir -p data logs reports
-      
+
+      - name: 量能确认前置检查（DSA v5 P0-3）
+        # If a previous run left a pending volume confirmation (ratio
+        # outside 0.1-10x) and it timed out or crossed the next scheduled
+        # run, pause this run instead of letting it auto-run unconfirmed.
+        # A forced manual dispatch skips this gate: the operator takes
+        # responsibility for the confirmation. The state file only exists
+        # in the checkout when a previous run committed it; it is also
+        # uploaded with the artifacts below so the record survives.
+        if: github.event.inputs.force_run != 'true'
+        run: |
+          python - <<'PY'
+          import sys
+          from src.services.volume_confirmation import (
+              load_confirmation_state,
+              should_pause_next_run,
+          )
+          record = load_confirmation_state("data/volume_confirmation_state.json")
+          if should_pause_next_run(record):
+              print("::error::Pending volume confirmation (ratio outside 0.1-10x) timed out or crossed the next scheduled run; pausing this run. Confirm manually (Rio, Wind daily K-line) and re-run.")
+              sys.exit(1)
+          print("Volume confirmation pre-check passed (no blocking pending request).")
+          PY
+
       - name: 执行股票分析
         env:
           # ==========================================
@@ -581,6 +604,7 @@ jobs:
           path: |
             reports/
             logs/
+            data/volume_confirmation_state.json
           retention-days: 30
       
       - name: 显示运行结果
